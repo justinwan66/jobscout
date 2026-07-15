@@ -486,16 +486,23 @@ SELECT_ANSWERS = [
     (["country code"], ["+1", "United States"]),
     (["country"], ["United States"]),
     (["location (city)", "current location"], ["Ithaca", "New York"]),
-    (["state", "province", "reside"], ["New York"]),
+    # veteran/gender/race BEFORE the state rule — "United States Armed Forces"
+    # etc. contain "state"; specific rules must win first
+    (["veteran"], ["No, I am not a veteran", "not a veteran",
+                   "I am not a protected veteran", "not a protected veteran",
+                   "No"]),
+    (["gender"], [ANSWERS["eeo"]["gender"], "Man", "Male"]),
+    (["race", "ethnic", "racial"],
+     ["East Asian", ANSWERS["eeo"]["race"], "Asian", "not hispanic"]),
+    # "state of residence"/"state/province" — NOT bare "state" (hits "United
+    # States"); a plain address "State" field is rare in these forms
+    (["state of residence", "state/province", "state / province",
+      "which state", "what state", "province", "reside"], ["New York"]),
     (["relocat"], ["Yes"]),
     (["interviewed"], ["No"]),
     (["export control", "u.s. person", "us person"], ["Yes"]),
     (["clearance"], ["No", "None", "I have not"]),
     (["hispanic", "latino"], ["No", "Not Hispanic"]),
-    (["gender"], [ANSWERS["eeo"]["gender"], "Male"]),
-    (["race", "ethnic"], [ANSWERS["eeo"]["race"], "Asian"]),
-    (["veteran"], ["I am not a protected veteran", "not a protected veteran",
-                   "not a veteran", "No"]),
     (["disability", "disabled"], ["No, I do", "I do not have a disability",
                                   "No", "I don't wish"]),
     (["pronoun"], ["He/Him", "He / Him", "he/him"]),

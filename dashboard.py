@@ -128,9 +128,12 @@ details.more .menu button:hover { background:var(--card); }
 .toolbar button.apply { color:#fff; background:var(--accent); border-color:var(--accent);
   font-weight:700; }
 .toolbar button:disabled { opacity:.7; cursor:default; }
-.fit { display:inline-block; font-size:.72rem; font-weight:700; color:#7c5cff;
-  background:rgba(124,92,255,.14); border:1px solid rgba(124,92,255,.4);
-  border-radius:6px; padding:.05rem .4rem; margin-right:.4rem; white-space:nowrap; }
+.fit { display:inline-block; font-size:.72rem; font-weight:700;
+  color:var(--muted); background:rgba(148,148,148,.14);
+  border:1px solid rgba(148,148,148,.35); border-radius:6px;
+  padding:.05rem .4rem; margin-right:.4rem; white-space:nowrap; }
+.fit.top { color:#7c5cff; background:rgba(124,92,255,.14);
+  border-color:rgba(124,92,255,.5); }
 .empty { color:var(--muted); text-align:center; padding:3rem 0; }
 footer { color:var(--muted); font-size:.78rem; text-align:center;
          padding:1rem; }
@@ -199,7 +202,7 @@ function card(j) {
       ${logo(j)}
       <div class="body">
         <div class="top">
-          ${j.fit_rank ? `<span class="fit" title="${esc(j.fit_note||'')}">🎯 #${j.fit_rank} fit</span> ` : ""}
+          ${j.fit_rank ? `<span class="fit${j.fit_rank<=3?' top':''}" title="${esc(j.fit_note||'')}">${j.fit_rank<=3?'🎯 ':''}#${j.fit_rank}</span> ` : ""}
           <a class="title" href="${j.url}" target="_blank">${esc(j.title)}</a>
           ${chip(j)}
         </div>
@@ -516,7 +519,12 @@ def query_jobs(status, q):
     con.close()
     for r in rows:
         r["hand_review"] = (r.get("company") or "").lower() in HAND_REVIEW
-    rows.sort(key=lambda r: not r["hand_review"])  # high-profile first (stable)
+    # if any job in view is fit-ranked, order by rank (ranked first, best-to-
+    # worst); otherwise keep the high-profile-first default
+    if any(r.get("fit_rank") for r in rows):
+        rows.sort(key=lambda r: (r.get("fit_rank") is None, r.get("fit_rank") or 0))
+    else:
+        rows.sort(key=lambda r: not r["hand_review"])  # high-profile first (stable)
     tab_counts = {
         "new": counts.get("new", 0),
         "needs_review": counts.get("needs_review", 0),

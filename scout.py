@@ -879,9 +879,9 @@ def full_description(source, company, url):
     return ""
 
 
-RANK_PROMPT = """You are helping Justin decide which few jobs to actually \
-apply to. Applying to many near-identical roles at one company looks \
-scattershot, so he wants the {top} that BEST fit him — where he's both \
+RANK_PROMPT = """You are helping Justin decide which jobs to actually apply \
+to. Applying to many near-identical roles at one company looks scattershot, \
+so he wants ALL of them ranked best-to-worst by fit — where he's both \
 competitive AND genuinely well-matched.
 
 Justin: Cornell undergrad, B.S. Biometry & Statistics (expected May 2028), \
@@ -890,8 +890,8 @@ dashboards, experimentation. Seeking internships / entry-level data & \
 analytics roles. Weaker fit: heavy software/ML-infra engineering, deep \
 domain specialties, roles clearly wanting years of experience.
 
-Below are {n} postings (numbered). Return ONLY a JSON array of the top {top}, \
-best first:
+Below are {n} postings (numbered). Return ONLY a JSON array ranking ALL {n} \
+of them, best fit first, every posting appearing exactly once:
 [{{"n": <number>, "score": <0-100 fit>, "why": "<=15 words"}}]
 
 Postings:
@@ -928,9 +928,9 @@ def cmd_rank(company_filter=None, top=3):
     listing = "\n\n".join(
         f"[{i+1}] {title}\n{(desc or '(no description)')[:900]}"
         for i, (_, title, desc) in enumerate(cands))
-    prompt = RANK_PROMPT.format(top=top, n=len(cands)) + listing
+    prompt = RANK_PROMPT.format(n=len(cands)) + listing
     try:
-        raw = llm_complete(prompt, max_tokens=600)
+        raw = llm_complete(prompt, max_tokens=180 + 40 * len(cands))
         m = re.search(r"\[.*\]", raw, re.S)
         picks = json.loads(m.group(0)) if m else []
     except Exception as e:
@@ -938,12 +938,14 @@ def cmd_rank(company_filter=None, top=3):
         con.close()
         return
 
-    con.execute("UPDATE jobs SET fit_rank=NULL WHERE status IN ('new','needs_review')"
-                + (" AND lower(company)=?" if company_filter else ""),
-                params)
-    print(f"\nTop {min(top, len(picks))} fits"
-          f"{' at ' + company_filter if company_filter else ''} for Justin:\n")
-    for rank, p in enumerate(picks[:top], 1):
+    # clear old ranks for this scope, then write the full ordering
+    con.execute("UPDATE jobs SET fit_rank=NULL, fit_note=NULL "
+                "WHERE status IN ('new','needs_review')"
+                + (" AND lower(company)=?" if company_filter else ""), params)
+    print(f"\nAll {len(cands)} ranked by fit"
+          f"{' at ' + company_filter if company_filter else ''} "
+          "(🎯 = top 3):\n")
+    for rank, p in enumerate(picks, 1):
         idx = p.get("n", 0) - 1
         if not (0 <= idx < len(cands)):
             continue
@@ -951,10 +953,11 @@ def cmd_rank(company_filter=None, top=3):
         note = f"{p.get('score', '?')}/100 — {p.get('why', '')}"
         con.execute("UPDATE jobs SET fit_rank=?, fit_note=? WHERE id=?",
                     (rank, note, jid))
-        print(f"  {rank}. {title}\n     {note}\n")
+        star = "🎯" if rank <= 3 else "  "
+        print(f"  {star} {rank}. {title}\n        {note}\n")
     con.commit()
     con.close()
-    log(f"rank: tagged top {min(top, len(picks))} with fit_rank")
+    log(f"rank: ranked all {len(picks)} jobs by fit")
 
 
 def cmd_list(n=20):
