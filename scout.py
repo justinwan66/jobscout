@@ -439,9 +439,12 @@ def _llm_via_api(prompt, model, api_key, max_tokens=50):
 
 
 def _llm_via_cli(prompt, model, cmd):
-    """Claude Code CLI — uses the local login; no API key needed."""
-    r = subprocess.run([cmd, "-p", "--model", model],
-                       input=prompt, capture_output=True, text=True, timeout=90)
+    """Claude Code CLI — uses the local subscription login; no API key needed.
+    --permission-mode bypassPermissions stops the CLI prompting for file/data
+    access on every spawn (safe here: a text-only completion, no tools)."""
+    r = subprocess.run(
+        [cmd, "-p", "--permission-mode", "bypassPermissions", "--model", model],
+        input=prompt, capture_output=True, text=True, timeout=90)
     return r.stdout or ""
 
 
