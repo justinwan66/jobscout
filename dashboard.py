@@ -43,19 +43,25 @@ PAGE = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>JobScout</title>
 <style>
-:root { --bg:#fff; --fg:#1a1a2e; --muted:#667; --card:#f6f7f9; --line:#e3e5e8;
-        --accent:#3056d3; --hot:#c2410c; --gold:#b8860b; --ok:#15803d; --warn:#b45309; }
+:root { --bg:#eef0f4; --fg:#1a1a2e; --muted:#667; --card:#fff; --elev:#f6f7f9;
+        --line:#dcdfe4; --accent:#3056d3; --hot:#c2410c; --gold:#b8860b;
+        --ok:#15803d; --warn:#b45309;
+        --shadow:0 1px 2px rgba(20,22,40,.07), 0 3px 10px rgba(20,22,40,.05);
+        --shadow-lg:0 2px 6px rgba(20,22,40,.10), 0 8px 24px rgba(20,22,40,.08); }
 @media (prefers-color-scheme: dark) {
-  :root { --bg:#14161a; --fg:#e8eaed; --muted:#9aa0a6; --card:#1e2126;
-          --line:#2c3038; --accent:#7c9aff; --hot:#fdba74; --gold:#f5b301;
-          --ok:#86efac; --warn:#fcd34d; }
+  :root { --bg:#0e1013; --fg:#e8eaed; --muted:#9aa0a6; --card:#1c1f26;
+          --elev:#262a33; --line:#333944; --accent:#7c9aff; --hot:#fdba74;
+          --gold:#f5b301; --ok:#86efac; --warn:#fcd34d;
+          --shadow:0 1px 2px rgba(0,0,0,.5), 0 3px 12px rgba(0,0,0,.35);
+          --shadow-lg:0 2px 6px rgba(0,0,0,.55), 0 10px 30px rgba(0,0,0,.45); }
 }
 * { box-sizing:border-box; margin:0; }
 body { background:var(--bg); color:var(--fg);
        font:15px/1.5 -apple-system, "SF Pro Text", Helvetica, sans-serif; }
 header { display:flex; flex-wrap:wrap; gap:.75rem; align-items:center;
          padding:1rem 1.25rem; border-bottom:1px solid var(--line);
-         position:sticky; top:0; background:var(--bg); z-index:2; }
+         position:sticky; top:0; background:var(--card); z-index:2;
+         box-shadow:var(--shadow); }
 h1 { font-size:1.15rem; margin-right:.5rem; }
 h1 span { color:var(--muted); font-weight:400; font-size:.85rem; }
 input[type=search] { flex:1; min-width:180px; padding:.45rem .7rem;
@@ -72,7 +78,11 @@ main { max-width:900px; margin:0 auto; padding:1rem 1.25rem 4rem; }
        text-transform:uppercase; letter-spacing:.06em; margin:1.1rem 0 .5rem; }
 .job { display:flex; gap:1rem; align-items:center; padding:.85rem 1rem;
        border:1px solid var(--line); border-left:3px solid var(--line);
-       border-radius:10px; margin-bottom:.6rem; background:var(--card); }
+       border-radius:10px; margin-bottom:.7rem; background:var(--card);
+       box-shadow:var(--shadow); transition:transform .12s ease,
+       box-shadow .12s ease, background .12s ease; }
+.job:hover { background:var(--elev); box-shadow:var(--shadow-lg);
+       transform:translateY(-1px); }
 .job.hot { border-left-color:var(--hot); }
 .job.hr { border-left-color:var(--gold); }
 .job .body { flex:1; min-width:0; }
