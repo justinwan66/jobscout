@@ -15,6 +15,7 @@ Usage:
 
 import html
 import json
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor
 import smtplib
@@ -473,9 +474,15 @@ def _ntfy_post(topic, title, body, url=None):
 
 def notify_ntfy(new_jobs):
     """Phone push via ntfy.sh — works anywhere, even with the laptop asleep
-    elsewhere; subscribe to the configured topic in the ntfy app."""
+    elsewhere; subscribe to the configured topic in the ntfy app.
+    send_from: 'cloud' = only the GitHub Actions poller pushes (default once
+    cloud polling exists — avoids double pushes), 'local'/'both' as named."""
     cfg = CONFIG["notify"].get("ntfy", {})
     if not cfg.get("enabled") or not cfg.get("topic"):
+        return
+    is_cloud = os.environ.get("JOBSCOUT_CLOUD") == "1"
+    mode = cfg.get("send_from", "both")
+    if (mode == "cloud" and not is_cloud) or (mode == "local" and is_cloud):
         return
     cap = CONFIG["notify"]["max_individual_notifications"]
     try:
@@ -523,7 +530,9 @@ def collect_jobs(include_broad, include_custom=False):
                 continue
             for q in cb.get("queries", []):
                 tasks.append((f"{site}:{q}", lambda f=fetch, s=q: f(s)))
-        if sites.get("meta") and cb.get("meta_queries"):
+        # meta needs the local Playwright venv — skip quietly where absent (cloud)
+        if (sites.get("meta") and cb.get("meta_queries")
+                and (BASE / ".venv" / "bin" / "python").exists()):
             tasks.append(("meta", lambda: fetch_meta(cb["meta_queries"])))
 
     def run_task(task):
@@ -680,6 +689,52 @@ def cmd_run(seed=False):
             log(f"WARN reconcile spawn failed: {e}")
 
 
+def cmd_cloud():
+    """Poll from GitHub Actions while the Mac may be asleep: JSON seen-set
+    instead of sqlite, ntfy pushes only, ignores poll_window (the whole point
+    is covering overnight/lid-closed hours). First run seeds silently."""
+    state_path = Path(os.environ.get("JOBSCOUT_STATE",
+                                     str(BASE / "cloud_state.json")))
+    state = (json.loads(state_path.read_text())
+             if state_path.exists() else {})
+    seen_list = state.get("seen", [])
+    seen = set(seen_list)
+    first_run = not seen
+
+    jobs, errors = collect_jobs(include_broad=False, include_custom=True)
+    for e in errors:
+        log(f"WARN source failed: {e}")
+
+    inc, exc, boost, loc_re = compile_filters()
+    new_jobs = []
+    for job in jobs:
+        tier = matches(job, inc, exc, boost, loc_re)
+        if not tier or not job["url"]:
+            continue
+        jid = job_id(job)
+        if jid in seen:
+            continue
+        seen.add(jid)
+        seen_list.append(jid)
+        try:
+            desc = get_description(job)
+        except Exception:
+            desc = ""
+        if desc and screen_description(desc)[0] == "exclude":
+            continue
+        job["tier"] = tier
+        new_jobs.append(job)
+
+    if new_jobs and not first_run:
+        os.environ["JOBSCOUT_CLOUD"] = "1"
+        notify_ntfy(new_jobs)
+    state_path.write_text(json.dumps(
+        {"seen": seen_list[-8000:]}))  # cap growth; drops oldest first
+    log(f"cloud run: scanned {len(jobs)}, new {len(new_jobs)}"
+        f"{' (seeded silently)' if first_run else ''}, "
+        f"source errors {len(errors)}")
+
+
 def cmd_list(n=20):
     con = db_connect()
     rows = con.execute(
@@ -711,6 +766,8 @@ def main():
                 and not within_poll_window()):
             return
         cmd_run(seed="--seed" in args)
+    elif cmd == "cloud":
+        cmd_cloud()
     elif cmd == "list":
         cmd_list(int(args[1]) if len(args) > 1 else 20)
     elif cmd == "test-notify":

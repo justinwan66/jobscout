@@ -279,7 +279,8 @@
     "max_individual_notifications": 5,
     "ntfy": {
       "enabled": true,
-      "topic": "jobscout-jwan-22d2674618"
+      "topic": "jobscout-jwan-22d2674618",
+      "send_from": "cloud"
     }
   }
 }

@@ -12,3 +12,4 @@ __pycache__/
 *.pyc
 *.tmp
 .imap_password
+cloud_state.json

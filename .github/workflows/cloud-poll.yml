@@ -1,0 +1,44 @@
+name: cloud-poll
+# Polls job boards while the Mac may be asleep. Every 30 min ≈ 48 billed
+# minutes/day — inside the 2000/mo free tier for private repos. State (seen
+# job ids) lives on the cloud-state branch so runs stay deduplicated.
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: cloud-poll
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: restore state
+        run: |
+          git fetch origin cloud-state:cloud-state 2>/dev/null \
+            && git show cloud-state:cloud_state.json > cloud_state.json \
+            || echo "no prior state (first run seeds silently)"
+
+      - name: poll
+        env:
+          JOBSCOUT_CLOUD: "1"
+        run: python3 scout.py cloud
+
+      - name: persist state
+        run: |
+          git config user.name "jobscout-cloud"
+          git config user.email "actions@users.noreply.github.com"
+          git checkout -B cloud-state
+          git add -f cloud_state.json
+          git diff --cached --quiet && echo "state unchanged" && exit 0
+          git commit -m "cloud state $(date -u +%FT%TZ)"
+          git push -f origin cloud-state
