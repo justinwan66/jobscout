@@ -997,7 +997,7 @@ def resolve_apply_url(source, company, url):
 # ------------------------------------------------------------ main
 
 def run(job_ref, dry_run=False, browser=None, assist=False, review=False,
-        precheck=False):
+        precheck=False, batch=False):
     visible = assist or review          # a human is watching this window
     con = sqlite3.connect(DB_PATH, timeout=30)  # tolerate concurrent shard writes
     row = con.execute(
@@ -1055,6 +1055,14 @@ def run(job_ref, dry_run=False, browser=None, assist=False, review=False,
             con.commit()
             con.close()
             log(f"MANUAL {company}: {title} — flagged for manual apply")
+            return 0
+        # a batch (Assist all) must NOT open one Chrome tab per job — that
+        # floods the browser. Flag them; the user opens each with the per-job
+        # "Open in Chrome" button, one at a time.
+        if batch:
+            finish("needs_review",
+                   "apply in your own Chrome — click Open in Chrome (⌘⇧J to autofill)")
+            log(f"MANUAL {company}: {title} — flagged (batch; not auto-opened)")
             return 0
         if not dry_run and (visible or assist):
             open_in_real_chrome(url)
@@ -1371,7 +1379,7 @@ def run_all(dry_run=False, limit=None, tier=None, shard=None, assist=False,
     try:
         for jid, company, title in eligible:
             try:
-                run(jid, dry_run=dry_run, browser=shared, assist=assist)
+                run(jid, dry_run=dry_run, browser=shared, assist=assist, batch=True)
             except Exception as e:
                 log(f"ERROR {company}: {title} — batch-level: {e}")
     finally:
