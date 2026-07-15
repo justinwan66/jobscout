@@ -378,6 +378,7 @@ TEXT_FIELDS = [
      ANSWERS["employment"]["current_company"]),
     (["recent job title", "current job title", "current title",
       "most recent title"], ANSWERS["employment"]["current_title"]),
+    (["sponsorship", "sponsor"], "No"),  # before work-authorization: collide
     (["work authorization"],
      "U.S. citizen — authorized to work in the U.S.; no sponsorship required"),
     (["employment history", "history with"], "None"),
@@ -439,10 +440,12 @@ def pick_option(question, options):
 # Each value is a list of acceptable answers in preference order; the first
 # that matches an actual option on the widget wins.
 SELECT_ANSWERS = [
+    # sponsor MUST precede authorization: "require sponsorship for work
+    # authorization?" contains both fragments, and the answers are opposite
+    (["sponsor", "immigration"], ["No, I do", "No", "No,"]),
     (["authorized to work", "legally authorized", "work authorization",
       "eligible to work", "legally authorised", "authorised to work"],
      ["Yes, no restriction", "Yes", "Yes,"]),
-    (["sponsor", "immigration"], ["No, I do", "No", "No,"]),
     (["country code"], ["+1", "United States"]),
     (["country"], ["United States"]),
     (["location (city)", "current location"], ["Ithaca", "New York"]),
