@@ -64,6 +64,19 @@ OK_MARKERS = ("thank you for applying", "thanks for applying",
               "we've got your application")
 
 
+# page states that mean "stop, don't fill": the posting is gone, or the
+# site has bot-flagged this network (job still alive — retry later)
+DEAD_MARKERS = ("can't find that page", "cannot find that page",
+                "job not found", "posting not found",
+                "no longer accepting applications",
+                "this job is no longer available",
+                "position has been filled", "posting has closed",
+                "this position is no longer open")
+BLOCK_MARKERS = ("access is temporarily restricted",
+                 "we detected unusual activity",
+                 "verify you are human", "are you a robot")
+
+
 def submission_confirmed(page):
     """True once the page shows an application-received confirmation."""
     try:
@@ -1032,6 +1045,22 @@ def run(job_ref, dry_run=False, browser=None, assist=False, review=False,
             pass
         # brief settle; SPAs (Ashby) need a touch more than server-rendered forms
         page.wait_for_timeout(700 if ats == "ashby" else 300)
+
+        # dead posting / bot-block triage — don't fill or sit on these pages
+        try:
+            body_txt = page.inner_text("body").lower()
+        except Exception:
+            body_txt = ""
+        if any(m in body_txt for m in DEAD_MARKERS):
+            log(f"GONE {company}: {title} — posting removed/closed")
+            finish("hidden", "posting removed or closed")
+            return 0
+        if any(m in body_txt for m in BLOCK_MARKERS):
+            log(f"BLOCKED {company}: {title} — site is rate-limiting this "
+                "network; retry later")
+            finish("needs_review", "site bot-blocked automation — retry "
+                   "later or apply manually")
+            return 0
 
         # Only hunt for an Apply button when we're NOT already on a direct
         # form, or when the direct form somehow rendered no fields.
