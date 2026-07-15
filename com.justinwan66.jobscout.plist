@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.justinwan66.jobscout</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/justinwan66/personal/jobscout/scout.py</string>
+        <string>run</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>60</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/justinwan66/personal/jobscout/logs/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/justinwan66/personal/jobscout/logs/launchd.err.log</string>
+</dict>
+</plist>

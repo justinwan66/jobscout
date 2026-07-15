@@ -1,0 +1,49 @@
+{
+  "work_authorized_us": "",
+  "requires_sponsorship": "",
+  "eeo": {
+    "gender": "",
+    "race": "",
+    "hispanic_latino": "",
+    "veteran": "",
+    "disability": ""
+  },
+  "gpa": "",
+  "gpa_policy": "",
+  "education": {
+    "school": "",
+    "degree_level": "",
+    "field_of_study": [
+      "",
+      "",
+      "",
+      "",
+      ""
+    ],
+    "start_date": "",
+    "end_date": ""
+  },
+  "availability": "",
+  "earliest_start": "",
+  "graduation_date": "",
+  "how_did_you_hear": "",
+  "salary_expectation": "",
+  "cover_letter_policy": "",
+  "transcript_path": "",
+  "location": {
+    "country": "",
+    "city": "",
+    "state": "",
+    "phone_country_code": ""
+  },
+  "willing_hybrid_onsite": "",
+  "gender_identity": "",
+  "employment": {
+    "current_company": "",
+    "current_title": ""
+  },
+  "open_to_relocation": "",
+  "citizenship": "",
+  "sat_score": "",
+  "interviewed_before": ""
+}

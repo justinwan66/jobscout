@@ -1,0 +1,14 @@
+# personal data — never commit
+answers.json
+profile.json
+jobs.db
+logs/
+docs/
+logos/
+
+# local runtime
+.venv/
+__pycache__/
+*.pyc
+*.tmp
+.imap_password
