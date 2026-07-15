@@ -202,7 +202,7 @@ function card(j) {
       ${logo(j)}
       <div class="body">
         <div class="top">
-          ${j.fit_rank ? `<span class="fit${j.fit_rank<=3?' top':''}" title="${esc(j.fit_note||'')}">${j.fit_rank<=3?'🎯 ':''}#${j.fit_rank}</span> ` : ""}
+          ${j.fit_rank && j.fit_rank<=3 ? `<span class="fit top" title="${esc(j.fit_note||'')}">🎯 #${j.fit_rank} fit</span> ` : ""}
           <a class="title" href="${j.url}" target="_blank">${esc(j.title)}</a>
           ${chip(j)}
         </div>

@@ -289,5 +289,8 @@
     "model": "claude-haiku-4-5-20251001",
     "max_desc_chars": 6000,
     "max_per_run": 10
+  },
+  "rank": {
+    "hide_below_score": 60
   }
 }

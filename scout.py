@@ -942,22 +942,38 @@ def cmd_rank(company_filter=None, top=3):
     con.execute("UPDATE jobs SET fit_rank=NULL, fit_note=NULL "
                 "WHERE status IN ('new','needs_review')"
                 + (" AND lower(company)=?" if company_filter else ""), params)
+    # low-fit jobs beyond the top 3 get auto-hidden to keep the bin focused
+    # (reversible from the Hidden tab); top 3 always stay visible
+    threshold = CONFIG.get("rank", {}).get("hide_below_score", 60)
     print(f"\nAll {len(cands)} ranked by fit"
           f"{' at ' + company_filter if company_filter else ''} "
           "(🎯 = top 3):\n")
+    hidden = 0
     for rank, p in enumerate(picks, 1):
         idx = p.get("n", 0) - 1
         if not (0 <= idx < len(cands)):
             continue
         jid, title, _ = cands[idx]
-        note = f"{p.get('score', '?')}/100 — {p.get('why', '')}"
+        try:
+            score = int(p.get("score", 0))
+        except (TypeError, ValueError):
+            score = 0
+        note = f"{score}/100 — {p.get('why', '')}"
         con.execute("UPDATE jobs SET fit_rank=?, fit_note=? WHERE id=?",
                     (rank, note, jid))
-        star = "🎯" if rank <= 3 else "  "
-        print(f"  {star} {rank}. {title}\n        {note}\n")
+        if rank > 3 and score < threshold:
+            con.execute("UPDATE jobs SET status='hidden', "
+                        "reason=? WHERE id=? AND status IN ('new','needs_review')",
+                        (f"low fit ({score}/100) — ranked out", jid))
+            hidden += 1
+            tag = "hide"
+        else:
+            tag = "🎯" if rank <= 3 else "keep"
+        print(f"  {tag:>4} {rank}. {title}\n        {note}\n")
     con.commit()
     con.close()
-    log(f"rank: ranked all {len(picks)} jobs by fit")
+    log(f"rank: ranked {len(picks)} jobs; hid {hidden} low-fit "
+        f"(score<{threshold}, beyond top 3)")
 
 
 def cmd_list(n=20):
