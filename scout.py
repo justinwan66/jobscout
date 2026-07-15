@@ -199,8 +199,9 @@ def fetch_amazon(query):
             "title": j.get("title", ""),
             "location": j.get("normalized_location") or j.get("location", ""),
             "url": "https://www.amazon.jobs" + (j.get("job_path") or ""),
-            "description": (j.get("description") or "") + " " +
-                           (j.get("basic_qualifications") or ""),
+            # no description here: the search teaser proved unreliable (missed
+            # full qualifications). get_description falls through to
+            # full_description(), which parses the complete HTML posting.
         }
 
 
@@ -690,9 +691,25 @@ def cmd_run(seed=False):
         jid = job_id(job)
         if con.execute("SELECT 1 FROM jobs WHERE id=?", (jid,)).fetchone():
             continue
-        # second-stage screen on the full description (new jobs only)
+
+        def record_excluded(reason):
+            # store excluded jobs as hidden so they are NOT re-screened every
+            # poll (that re-spawned the LLM/keychain prompt every minute)
+            con.execute(
+                "INSERT OR IGNORE INTO jobs (id, source, company, title, "
+                "location, url, tier, first_seen, status, reason) VALUES "
+                "(?,?,?,?,?,?,?,?, 'hidden', ?)",
+                (jid, job["source"], job["company"], job["title"],
+                 job["location"], job["url"], tier,
+                 datetime.now(timezone.utc).isoformat(), reason))
+
+        # second-stage screen on the full description (new jobs only).
+        # get_description covers feed/greenhouse/etc; full_description adds the
+        # custom boards (amazon/google/apple) whose desc get_description lacked
+        # — WITHOUT this, Amazon jobs skipped screening and passed on title only
         try:
-            desc = get_description(job)
+            desc = get_description(job) or full_description(
+                job["source"], job["company"], job["url"])
         except Exception as e:
             desc = ""
             log(f"WARN desc fetch failed {job['company']}: {e}")
@@ -700,6 +717,7 @@ def cmd_run(seed=False):
             verdict, why = screen_description(desc)
             if verdict == "exclude":
                 log(f"DESC-SKIP {job['company']}: {job['title']} — {why}")
+                record_excluded(f"desc-screen: {why}")
                 continue
             if verdict == "promote" and tier == "match":
                 log(f"DESC-PROMOTE {job['company']}: {job['title']} — {why}")
@@ -710,6 +728,7 @@ def cmd_run(seed=False):
                 lv, lwhy = llm_screen(job["title"], desc)
                 if lv == "exclude":
                     log(f"LLM-SKIP {job['company']}: {job['title']} — {lwhy}")
+                    record_excluded(f"llm-screen: {lwhy}")
                     continue
         job["tier"] = tier
         hr = (job["company"] or "").lower() in HAND_REVIEW
@@ -838,15 +857,14 @@ def full_description(source, company, url):
     Covers every source; '' when unavailable."""
     try:
         if source == "amazon":
-            m = re.search(r"/jobs/(\d+)", url)
-            if not m:
-                return ""
-            d = get_json(f"https://www.amazon.jobs/en/jobs/{m.group(1)}.json",
-                         headers=BROWSER_UA)
-            j = d.get("job", {})
-            return strip_html(" ".join(filter(None, (
-                j.get("description"), j.get("basic_qualifications"),
-                j.get("preferred_qualifications")))))
+            # per-job .json is 406-blocked; the HTML posting page carries the
+            # full description + qualifications (search-feed teaser did not)
+            html_txt = strip_html(get(url, headers=BROWSER_UA).decode(
+                "utf-8", "replace"))
+            i = html_txt.lower().find("basic qualifications")
+            if i < 0:
+                i = html_txt.lower().find("qualifications")
+            return html_txt[i:i + 4000] if i >= 0 else html_txt[:4000]
         if source == "greenhouse":
             m = re.search(r"(\d{6,})", url)
             if not m:
@@ -955,6 +973,9 @@ def cmd_rank(company_filter=None, top=3):
     print(f"\nAll {len(cands)} ranked by fit"
           f"{' at ' + company_filter if company_filter else ''} "
           "(🎯 = top 3):\n")
+    # auto-hide only declutters LARGE pools; for a handful of jobs, keep them
+    # all visible (hiding 2 of 5 is just annoying) and let the badges guide
+    declutter = len(picks) > CONFIG.get("rank", {}).get("hide_min_pool", 8)
     hidden = 0
     for rank, p in enumerate(picks, 1):
         idx = p.get("n", 0) - 1
@@ -968,7 +989,7 @@ def cmd_rank(company_filter=None, top=3):
         note = f"{score}/100 — {p.get('why', '')}"
         con.execute("UPDATE jobs SET fit_rank=?, fit_note=? WHERE id=?",
                     (rank, note, jid))
-        if rank > 3 and score < threshold:
+        if declutter and rank > 3 and score < threshold:
             con.execute("UPDATE jobs SET status='hidden', "
                         "reason=? WHERE id=? AND status IN ('new','needs_review')",
                         (f"low fit ({score}/100) — ranked out", jid))
