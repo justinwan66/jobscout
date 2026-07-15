@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "JobScout Autofill",
+  "version": "1.0",
+  "description": "Fill job applications in your own browser with JobScout answers — for SSO/logged-in applies the automation can't do.",
+  "permissions": ["activeTab", "scripting", "storage"],
+  "host_permissions": ["http://localhost:8765/*"],
+  "action": { "default_title": "JobScout: fill this application" },
+  "background": { "service_worker": "background.js" },
+  "commands": {
+    "fill": {
+      "suggested_key": { "default": "Ctrl+Shift+J", "mac": "Command+Shift+J" },
+      "description": "Fill the current application form"
+    }
+  }
+}

@@ -524,6 +524,26 @@ class Handler(BaseHTTPRequestHandler):
             jobs, counts = query_jobs(qs.get("status", ["new"])[0],
                                       qs.get("q", [""])[0])
             self.send(200, json.dumps({"jobs": jobs, "counts": counts}))
+        elif parsed.path == "/api/fill-spec":
+            # the SAME fill rules the Playwright engine uses, served to the
+            # Chrome extension so manual applies (SSO/logged-in Chrome) get
+            # auto-filled too. one source of truth: auto_apply.py.
+            try:
+                import auto_apply as aa
+                spec = {
+                    "text": [[frags, str(val)] for frags, val in aa.TEXT_FIELDS],
+                    "choice": aa.CHOICE_RULES,
+                    "select": aa.SELECT_ANSWERS,
+                }
+                body = json.dumps(spec)
+            except Exception as e:
+                body = json.dumps({"error": str(e)})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Length", str(len(body.encode())))
+            self.end_headers()
+            self.wfile.write(body.encode())
         elif parsed.path.startswith("/logo/"):
             domain = urllib.parse.unquote(parsed.path[6:]).lower()
             if not re.fullmatch(r"[a-z0-9.-]{1,80}", domain):
