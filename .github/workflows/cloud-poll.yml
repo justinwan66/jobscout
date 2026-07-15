@@ -31,6 +31,8 @@ jobs:
       - name: poll
         env:
           JOBSCOUT_CLOUD: "1"
+          # optional: add this repo secret to enable LLM screening in the cloud
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: python3 scout.py cloud
 
       - name: persist state

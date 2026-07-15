@@ -113,3 +113,19 @@ python3 -m playwright install chromium
   more than help. `apply.py` gets you to ~10 seconds per application instead.
 - If macOS notifications don't appear: System Settings → Notifications →
   Script Editor (or osascript) → Allow.
+
+## Running on another machine
+
+```bash
+git clone https://github.com/justinwan66/jobscout && cd jobscout && ./setup.sh
+```
+
+Then copy `answers.json`, `profile.json`, `.imap_password` (and optionally
+`jobs.db` for history) from the old machine — they contain personal data and
+are deliberately not in git. Run the **poller on only one machine at a time**;
+phone pushes come from the cloud workflow either way.
+
+**LLM screening portability:** with no setup it uses the local `claude` CLI
+login. Set `ANTHROPIC_API_KEY` (env var locally, or a repo Actions secret for
+the cloud poller) to make it work on any machine or in CI — Haiku costs well
+under $1/month at this volume.

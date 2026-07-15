@@ -425,25 +425,51 @@ Posting follows:
 """
 
 
+def _llm_via_api(prompt, model, api_key):
+    """Direct Anthropic API call — portable to any machine / CI with a key."""
+    body = json.dumps({"model": model, "max_tokens": 50,
+                       "messages": [{"role": "user", "content": prompt}]})
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages", data=body.encode(),
+        headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                 "content-type": "application/json"})
+    with urllib.request.urlopen(req, timeout=60, context=SSL_CTX) as r:
+        data = json.loads(r.read())
+    return "".join(b.get("text", "") for b in data.get("content", []))
+
+
+def _llm_via_cli(prompt, model, cmd):
+    """Claude Code CLI — uses the local login; no API key needed."""
+    r = subprocess.run([cmd, "-p", "--model", model],
+                       input=prompt, capture_output=True, text=True, timeout=90)
+    return r.stdout or ""
+
+
 def llm_screen(title, desc):
     """('ok'|'exclude'|'skip', why) — final judge on posts the regexes pass.
-    Fail-open: any CLI error/timeout keeps the job ('skip')."""
+    Uses ANTHROPIC_API_KEY when set (works anywhere, incl. CI), else the
+    local claude CLI. Fail-open: any error/timeout keeps the job ('skip')."""
     cfg = CONFIG.get("llm_screen", {})
     if not cfg.get("enabled") or not desc:
         return "skip", ""
+    model = cfg.get("model", "claude-haiku-4-5-20251001")
+    prompt = (LLM_PROMPT + f"TITLE: {title}\n\n"
+              + desc[:cfg.get("max_desc_chars", 6000)])
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     cmd = cfg.get("command", "claude")
-    if not (Path(cmd).exists() or subprocess.run(
-            ["which", cmd], capture_output=True).returncode == 0):
-        return "skip", "claude CLI not found"
-    text = f"TITLE: {title}\n\n{desc[:cfg.get('max_desc_chars', 6000)]}"
     try:
-        r = subprocess.run(
-            [cmd, "-p", "--model", cfg.get("model", "claude-haiku-4-5-20251001")],
-            input=LLM_PROMPT + text, capture_output=True, text=True, timeout=90)
-        out = (r.stdout or "").strip().splitlines()
+        if api_key:
+            raw = _llm_via_api(prompt, model, api_key)
+        elif Path(cmd).exists() or subprocess.run(
+                ["which", cmd], capture_output=True).returncode == 0:
+            raw = _llm_via_cli(prompt, model, cmd)
+        else:
+            return "skip", "no ANTHROPIC_API_KEY and no claude CLI"
+        out = raw.strip().splitlines()
         verdict = out[-1].strip() if out else ""
         if verdict.upper().startswith("FAIL"):
-            return "exclude", verdict.partition(":")[2].strip() or "LLM: not credible for undergrad"
+            return "exclude", (verdict.partition(":")[2].strip()
+                               or "LLM: not credible for undergrad")
         if verdict.upper().startswith("PASS"):
             return "ok", ""
         return "skip", f"unparseable verdict: {verdict[:40]}"
@@ -763,7 +789,7 @@ def cmd_cloud():
         log(f"WARN source failed: {e}")
 
     inc, exc, boost, loc_re = compile_filters()
-    new_jobs = []
+    new_jobs, llm_calls = [], 0
     for job in jobs:
         tier = matches(job, inc, exc, boost, loc_re)
         if not tier or not job["url"]:
@@ -777,8 +803,14 @@ def cmd_cloud():
             desc = get_description(job)
         except Exception:
             desc = ""
-        if desc and screen_description(desc)[0] == "exclude":
-            continue
+        if desc:
+            if screen_description(desc)[0] == "exclude":
+                continue
+            # LLM judge runs in cloud too when ANTHROPIC_API_KEY is set
+            if llm_calls < CONFIG.get("llm_screen", {}).get("max_per_run", 10):
+                llm_calls += 1
+                if llm_screen(job["title"], desc)[0] == "exclude":
+                    continue
         job["tier"] = tier
         new_jobs.append(job)
 
