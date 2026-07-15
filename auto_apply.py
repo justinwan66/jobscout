@@ -399,7 +399,10 @@ CHOICE_RULES = [
       "eligible to work"], ["yes"]),
     (["hispanic", "latino"], ["no"]),
     (["gender"], [ANSWERS["eeo"]["gender"], "man"]),
-    (["race", "ethnic"], [ANSWERS["eeo"]["race"]]),
+    # "asian" fragment covers per-checkbox EEO groups where each option is its
+    # own labeled field; "not hispanic" covers combined ethnicity lists
+    (["race", "ethnic", "asian"],
+     [ANSWERS["eeo"]["race"], "not hispanic"]),
     (["veteran"], ["i am not a protected veteran", "not a veteran", "no"]),
     (["disability", "disabled"], ["no, i do not", "i do not have a disability",
                                   "i don't wish to answer", "no"]),
@@ -437,7 +440,13 @@ def pick_option(question, options):
                         return opt
             for w in wanted:
                 for opt in options:
-                    if w in opt.lower():
+                    # short wants match whole words only — "no" must never
+                    # hit "Latino" or "Norway"
+                    if len(w) <= 3:
+                        if re.search(rf"(?<![a-z]){re.escape(w)}(?![a-z])",
+                                     opt.lower()):
+                            return opt
+                    elif w in opt.lower():
                         return opt
     return None
 
