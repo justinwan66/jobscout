@@ -236,30 +236,46 @@ function chip(j) {
       : j.status === "auto_applied" ? "🤖 fully auto" : "✓ marked applied";
     return `<span class="chip ok">${label}</span>`;
   }
-  // the "high-profile — review & submit" reason just restates the gold border
-  // and purple button — skip it
-  if (j.status === "needs_review" && j.reason && !(j.hand_review && /high.?profile/i.test(j.reason)))
+  // Don't repeat what the apply button already says: readiness-driven buttons
+  // (needs-info / captcha / form-issue / open-in-Chrome) and the gold-border
+  // high-profile button carry the state — a chip would just restate it.
+  const buttonCovers = ["missing-info", "captcha", "form-issue", "manual"]
+    .includes(j.readiness);
+  const hpCovers = j.hand_review && /high.?profile/i.test(j.reason || "");
+  if (j.status === "needs_review" && j.reason && !buttonCovers && !hpCovers)
     return `<span class="chip warn" title="${esc(j.reason)}">⚠ ${esc(shortReason(j.reason))}</span>`;
   return "";
 }
-// compress raw precheck output into a scannable label; full text lives in the tooltip
+// compress raw precheck output into a short scannable label; full text is in
+// the tooltip. Keep chips to ~2-3 words so cards stay uncluttered.
 function shortReason(t) {
+  const map = [
+    [/bot.?block|unusual activity|temporarily restricted/i, "bot-blocked — retry"],
+    [/sso|supported browser|sign.?in/i, "needs SSO sign-in"],
+    [/opened in your chrome/i, "opened in Chrome"],
+    [/weekly.*cap/i, "weekly cap hit"],
+    [/removed or closed|no longer/i, "posting closed"],
+  ];
+  for (const [re, label] of map) if (re.test(t)) return label;
   const parts = [];
   if (/captcha/i.test(t)) parts.push("captcha");
   const miss = (t.match(/required field empty/gi) || []).length;
   if (miss) parts.push(`${miss} missing field${miss > 1 ? "s" : ""}`);
-  if (/\\berror\\b/i.test(t)) parts.push("automation error");
+  if (/\\berror\\b/i.test(t)) parts.push("error");
   if (parts.length) return parts.join(" · ");
-  return t.length > 70 ? t.slice(0, 67) + "…" : t;
+  return t.length > 40 ? t.slice(0, 37) + "…" : t;
 }
 function applyBtn(j) {
+  // manual-apply (SSO/automation-blocked) wins even for high-profile companies —
+  // those can't be driven in the controlled browser at all
+  if (j.readiness === "manual")
+    return `<button class="warn" onclick="applyNow('${j.id}', this)" title="SSO/automation-blocked — opens in your Chrome; press ⌘⇧J to autofill">🧑‍💻 Open in Chrome</button>`;
   if (j.hand_review)
     return `<button class="review" onclick="applyNow('${j.id}', this)" title="fills the form, then you review & submit">🔍 Review &amp; submit</button>`;
   const state = {
     "missing-info": ["⚠ Apply — needs info", "fills what it can; you complete the rest"],
     captcha:        ["🔒 Apply — captcha",   "fills the form; you clear the captcha"],
     "form-issue":   ["⛔ Apply — form issue","opens the form so you can finish by hand"],
-    manual:         ["🧑‍💻 Open in Chrome",  "SSO/automation-blocked — opens in your Chrome; press ⌘⇧J to autofill"],
   }[j.readiness];
   if (state)
     return `<button class="warn" onclick="applyNow('${j.id}', this)" title="${state[1]}">${state[0]}</button>`;
