@@ -1201,28 +1201,39 @@ def run(job_ref, dry_run=False, browser=None, assist=False, review=False,
 
 
 def run_all(dry_run=False, limit=None, tier=None, shard=None, assist=False,
-            ready_only=False):
+            ready_only=False, include_review=False):
     """Zero-touch batch: walk every 'new' job (hot first), auto-apply to the
     ones not on the hand-review list. run() itself enforces the hand-review
     gate and weekly cap, so this just picks the queue and reports a tally.
     shard=(k, n) processes only every n-th job starting at k (for parallelism).
     assist=True runs a visible browser and pauses at verification gates.
-    ready_only=True limits to jobs graded 'ready' by the pre-check."""
+    ready_only=True limits to jobs graded 'ready' by the pre-check.
+    include_review=True (assist only) also queues needs_review jobs —
+    hand-review companies included, since run() forces review mode (never
+    auto-submits) for them; quick wins (ready, then captcha-only) first."""
     con = sqlite3.connect(DB_PATH, timeout=30)
-    sql = "SELECT id, company, title FROM jobs WHERE status='new'"
+    if include_review and assist:
+        sql = "SELECT id, company, title FROM jobs WHERE status IN ('new','needs_review')"
+    else:
+        sql = "SELECT id, company, title FROM jobs WHERE status='new'"
     params = []
     if ready_only:
         sql += " AND readiness='ready'"
     if tier:
         sql += " AND tier=?"
         params.append(tier)
-    sql += " ORDER BY (tier='hot') DESC, first_seen ASC"
+    sql += (" ORDER BY (tier='hot') DESC,"
+            " CASE readiness WHEN 'ready' THEN 0 WHEN 'captcha' THEN 1"
+            " WHEN 'form-issue' THEN 2 ELSE 3 END, first_seen ASC")
     rows = con.execute(sql, params).fetchall()
     con.close()
 
-    hr = hand_review_set()
-    eligible = [r for r in rows if (r[1] or "").lower() not in hr]
-    skipped = len(rows) - len(eligible)
+    if include_review and assist:
+        eligible, skipped = rows, 0  # visible run: review mode guards HR cos
+    else:
+        hr = hand_review_set()
+        eligible = [r for r in rows if (r[1] or "").lower() not in hr]
+        skipped = len(rows) - len(eligible)
     if limit:
         eligible = eligible[:limit]
     tag = ""
@@ -1360,6 +1371,7 @@ if __name__ == "__main__":
     precheck = "--precheck" in argv  # grade readiness, never submit
     recheck = "--recheck" in argv    # re-grade already-graded jobs
     ready_only = "--ready-only" in argv  # batch only 'ready' jobs
+    include_review = "--include-review" in argv  # assist batch incl. Review bin
     positional = [a for a in argv if not a.startswith("--")]
     limit = None
     tier = None
@@ -1395,7 +1407,8 @@ if __name__ == "__main__":
         if workers > 1 and shard is None:
             sys.exit(run_all_parallel(workers, dry_run=dry, limit=limit, tier=tier))
         sys.exit(run_all(dry_run=dry, limit=limit, tier=tier, shard=shard,
-                         assist=assist, ready_only=ready_only))
+                         assist=assist, ready_only=ready_only,
+                         include_review=include_review))
     if not positional:
         print(__doc__)
         sys.exit(1)

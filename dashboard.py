@@ -145,6 +145,7 @@ footer { color:var(--muted); font-size:.78rem; text-align:center;
   </div>
   <div class="toolbar">
     <button class="apply" onclick="applyAllReady(this)" title="assisted-apply every ready inbox job, one window at a time">🚀 Apply all ready</button>
+    <button onclick="assistAll(this)" title="walk EVERY inbox + review job, one visible window at a time — quick wins first; you clear gates and click submit">🙋 Assist all</button>
     <button onclick="recheck(this)" title="re-grade readiness of all inbox/review jobs">🔄 Re-check readiness</button>
   </div>
 </header>
@@ -291,6 +292,16 @@ async function applyNow(id, el) {
       el.textContent = "✅ window open — finish in browser";
     }
   } catch (e) { el.textContent = "⚠ failed"; el.disabled = false; }
+}
+async function assistAll(el) {
+  el.disabled = true; el.textContent = "🙋 launching…";
+  try {
+    const r = await fetch("/api/assist_all", {method:"POST"});
+    const d = await r.json();
+    el.textContent = d.status === "already running"
+      ? "🙋 already running" : `🙋 assisting ${d.count} jobs…`;
+  } catch { el.textContent = "🙋 failed"; }
+  setTimeout(() => { el.disabled = false; el.textContent = "🙋 Assist all"; }, 5000);
 }
 async function applyAllReady(el) {
   el.disabled = true; const t = el.textContent; el.textContent = "⏳ starting…";
@@ -598,6 +609,22 @@ class Handler(BaseHTTPRequestHandler):
             BATCH["apply_all"] = subprocess.Popen(
                 [str(VENV_PY), str(BASE / "auto_apply.py"), "--all", "--assist",
                  "--ready-only"], cwd=str(BASE), stdout=logf, stderr=logf)
+            self.send(200, json.dumps({"status": "launching", "count": count}))
+            return
+
+        if self.path == "/api/assist_all":
+            b = BATCH.get("assist_all")
+            if b and b.poll() is None:
+                self.send(200, json.dumps({"status": "already running", "count": 0}))
+                return
+            con = sqlite3.connect(DB_PATH, timeout=30)
+            count = con.execute("SELECT COUNT(*) FROM jobs "
+                                "WHERE status IN ('new','needs_review')").fetchone()[0]
+            con.close()
+            logf = open(BASE / "logs" / "assist.log", "a")
+            BATCH["assist_all"] = subprocess.Popen(
+                [str(VENV_PY), str(BASE / "auto_apply.py"), "--all", "--assist",
+                 "--include-review"], cwd=str(BASE), stdout=logf, stderr=logf)
             self.send(200, json.dumps({"status": "launching", "count": count}))
             return
 
