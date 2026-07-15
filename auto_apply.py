@@ -75,6 +75,13 @@ DEAD_MARKERS = ("can't find that page", "cannot find that page",
 BLOCK_MARKERS = ("access is temporarily restricted",
                  "we detected unusual activity",
                  "verify you are human", "are you a robot")
+# OAuth / SSO sign-in walls (Google/Apple/LinkedIn/Amazon): providers block
+# sign-in from automated browsers by design — cannot and should not be
+# scripted around. These MUST be done by a human in a normal browser.
+SSO_MARKERS = ("sign in with a supported browser", "couldn't sign you in",
+               "couldn't sign in", "this browser or app may not be secure",
+               "controlled through software automation",
+               "use a supported browser")
 
 
 def submission_confirmed(page):
@@ -1060,6 +1067,12 @@ def run(job_ref, dry_run=False, browser=None, assist=False, review=False,
                 "network; retry later")
             finish("needs_review", "site bot-blocked automation — retry "
                    "later or apply manually")
+            return 0
+        if any(m in body_txt for m in SSO_MARKERS):
+            log(f"SSO-WALL {company}: {title} — Google/SSO sign-in blocks "
+                "automated browsers; must apply in your own browser")
+            finish("needs_review", "requires Google/SSO sign-in — open in "
+                   "your normal browser and apply manually")
             return 0
 
         # Only hunt for an Apply button when we're NOT already on a direct
