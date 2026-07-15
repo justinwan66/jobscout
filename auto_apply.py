@@ -930,6 +930,25 @@ def is_hand_review(company):
     return (company or "").lower() in hand_review_set()
 
 
+def manual_apply_set():
+    """Companies that block automation / require SSO sign-in (Amazon, Google,
+    Apple…). Assist opens these in the user's real Chrome instead of the
+    controlled browser, where SSO works and the extension can autofill."""
+    return {c.lower() for c in CONFIG.get("auto_apply", {}).get(
+        "manual_apply_companies", [])}
+
+
+def open_in_real_chrome(url):
+    """Open a URL in the user's normal Chrome (not the automated browser)."""
+    for args in (["open", "-a", "Google Chrome", url], ["open", url]):
+        try:
+            if subprocess.run(args, capture_output=True).returncode == 0:
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def config_slug(company, ats):
     """Find the configured board slug for a company on a given ATS."""
     cl = (company or "").lower().replace(" ", "")
@@ -1020,6 +1039,31 @@ def run(job_ref, dry_run=False, browser=None, assist=False, review=False,
         finish("needs_review", "weekly per-company cap reached")
         if not dry_run:
             notify("JobScout: review needed", f"{company} — {title} (weekly cap)")
+        return 0
+
+    # Automation-hostile / SSO-required companies: never drive the controlled
+    # browser (it gets bot-blocked or hits a Google/Apple sign-in wall).
+    # Precheck marks them 'manual'; an assist/apply run opens the posting in
+    # the user's real Chrome, where the extension autofills (⌘⇧J) and SSO works.
+    if (company or "").lower() in manual_apply_set():
+        if precheck:
+            con.execute("UPDATE jobs SET readiness='manual', readiness_at=? "
+                        "WHERE id=?",
+                        (datetime.now(timezone.utc).isoformat(), jid))
+            con.execute("UPDATE jobs SET reason=? WHERE id=? AND status='needs_review'",
+                        ("apply in your own Chrome (SSO/automation-blocked) — ⌘⇧J to autofill", jid))
+            con.commit()
+            con.close()
+            log(f"MANUAL {company}: {title} — flagged for manual apply")
+            return 0
+        if not dry_run and (visible or assist):
+            open_in_real_chrome(url)
+            log(f"MANUAL {company}: {title} — opened in your Chrome (⌘⇧J to autofill)")
+            finish("needs_review",
+                   "opened in your Chrome — press ⌘⇧J to autofill, then sign in & submit")
+            notify("JobScout: apply in your browser 🧑‍💻", f"{company} — {title}")
+            return 0
+        finish("needs_review", "requires manual apply in your browser (SSO/automation-blocked)")
         return 0
 
     from playwright.sync_api import sync_playwright

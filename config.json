@@ -263,7 +263,12 @@
       "google",
       "alphabet"
     ],
-    "max_per_company_per_week": 5
+    "max_per_company_per_week": 5,
+    "manual_apply_companies": [
+      "amazon",
+      "google",
+      "apple"
+    ]
   },
   "notify": {
     "macos_notification": true,
@@ -291,6 +296,6 @@
     "max_per_run": 10
   },
   "rank": {
-    "hide_below_score": 60
+    "hide_below_score": 70
   }
 }

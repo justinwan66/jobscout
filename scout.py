@@ -930,11 +930,15 @@ def cmd_rank(company_filter=None, top=3):
         for i, (_, title, desc) in enumerate(cands))
     prompt = RANK_PROMPT.format(n=len(cands)) + listing
     try:
-        raw = llm_complete(prompt, max_tokens=180 + 40 * len(cands))
+        raw = llm_complete(prompt, max_tokens=400 + 45 * len(cands))
         m = re.search(r"\[.*\]", raw, re.S)
         picks = json.loads(m.group(0)) if m else []
     except Exception as e:
         log(f"rank: LLM error — {e}")
+        picks = []
+    # fail-safe: never wipe existing ranks on an empty/failed result
+    if not picks:
+        log("rank: no picks parsed — keeping existing ranks unchanged")
         con.close()
         return
 

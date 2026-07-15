@@ -202,7 +202,7 @@ function card(j) {
       ${logo(j)}
       <div class="body">
         <div class="top">
-          ${j.fit_rank && j.fit_rank<=3 ? `<span class="fit top" title="${esc(j.fit_note||'')}">🎯 #${j.fit_rank} fit</span> ` : ""}
+          ${j.fit_display ? `<span class="fit top" title="${esc(j.fit_note||'')}">🎯 #${j.fit_display} fit</span> ` : ""}
           <a class="title" href="${j.url}" target="_blank">${esc(j.title)}</a>
           ${chip(j)}
         </div>
@@ -259,6 +259,7 @@ function applyBtn(j) {
     "missing-info": ["⚠ Apply — needs info", "fills what it can; you complete the rest"],
     captcha:        ["🔒 Apply — captcha",   "fills the form; you clear the captcha"],
     "form-issue":   ["⛔ Apply — form issue","opens the form so you can finish by hand"],
+    manual:         ["🧑‍💻 Open in Chrome",  "SSO/automation-blocked — opens in your Chrome; press ⌘⇧J to autofill"],
   }[j.readiness];
   if (state)
     return `<button class="warn" onclick="applyNow('${j.id}', this)" title="${state[1]}">${state[0]}</button>`;
@@ -519,8 +520,19 @@ def query_jobs(status, q):
     con.close()
     for r in rows:
         r["hand_review"] = (r.get("company") or "").lower() in HAND_REVIEW
-    # if any job in view is fit-ranked, order by rank (ranked first, best-to-
-    # worst); otherwise keep the high-profile-first default
+    # badge the top 3 PER COMPANY among currently-visible jobs. fit_rank holds
+    # the LLM's absolute ordering; fit_display is recomputed here each request,
+    # so manually hiding a ranked job instantly promotes the next one — no
+    # re-rank / LLM call needed. (A full 🎯 re-rank re-scores from scratch.)
+    from collections import defaultdict
+    by_co = defaultdict(list)
+    for r in rows:
+        if r.get("fit_rank"):
+            by_co[(r.get("company") or "").lower()].append(r)
+    for lst in by_co.values():
+        lst.sort(key=lambda r: r["fit_rank"])
+        for i, r in enumerate(lst, 1):
+            r["fit_display"] = i if i <= 3 else None
     if any(r.get("fit_rank") for r in rows):
         rows.sort(key=lambda r: (r.get("fit_rank") is None, r.get("fit_rank") or 0))
     else:
