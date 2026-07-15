@@ -52,8 +52,16 @@ ASSIST_TIMEOUT_S = 300
 REVIEW_TIMEOUT_S = 1200   # high-profile review+submit — allow time to read/tailor
 ASSIST_POLL_MS = 2000
 
-OK_MARKERS = ("thank", "received", "submitted", "application complete",
-              "we've got", "we have received", "confirmation")
+# full phrases only — bare words ("thank", "received") false-positive on
+# posting-page marketing copy and mark jobs applied that never were
+OK_MARKERS = ("thank you for applying", "thanks for applying",
+              "thank you for your application",
+              "application has been received", "application received",
+              "application complete", "application submitted",
+              "application was submitted", "successfully submitted",
+              "we have received your application",
+              "we've received your application",
+              "we've got your application")
 
 
 def submission_confirmed(page):
