@@ -282,5 +282,12 @@
       "topic": "jobscout-jwan-22d2674618",
       "send_from": "cloud"
     }
+  },
+  "llm_screen": {
+    "enabled": true,
+    "command": "/Users/justinwan66/.nvm/versions/node/v22.22.3/bin/claude",
+    "model": "claude-haiku-4-5-20251001",
+    "max_desc_chars": 6000,
+    "max_per_run": 10
   }
 }

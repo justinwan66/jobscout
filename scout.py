@@ -401,6 +401,56 @@ def screen_description(text):
     return "ok", ""
 
 
+LLM_PROMPT = """You screen job postings for Justin: a Cornell undergrad \
+(B.S. Biometry & Statistics, expected May 2028), currently a data-analytics \
+intern with ~1 year of internship experience, seeking internships, co-ops, \
+and entry-level/new-grad data, analytics, ML, or strategy-ops roles.
+
+Regex filters already rejected postings with explicit blockers (>2 years \
+required, grad degree required, senior titles). Your job is the subtler \
+tail: postings whose scope, level, or phrasing implies they would never \
+seriously consider a current undergrad (e.g. "own the roadmap", \
+"founding/first hire", "shape company strategy", implied 5+ years, deep \
+domain mastery expected on day one).
+
+Could Justin CREDIBLY apply — meaning a recruiter would plausibly consider \
+him rather than screen him out instantly?
+
+Reply with EXACTLY one line:
+PASS
+or
+FAIL: <short reason, under 12 words>
+
+Posting follows:
+"""
+
+
+def llm_screen(title, desc):
+    """('ok'|'exclude'|'skip', why) — final judge on posts the regexes pass.
+    Fail-open: any CLI error/timeout keeps the job ('skip')."""
+    cfg = CONFIG.get("llm_screen", {})
+    if not cfg.get("enabled") or not desc:
+        return "skip", ""
+    cmd = cfg.get("command", "claude")
+    if not (Path(cmd).exists() or subprocess.run(
+            ["which", cmd], capture_output=True).returncode == 0):
+        return "skip", "claude CLI not found"
+    text = f"TITLE: {title}\n\n{desc[:cfg.get('max_desc_chars', 6000)]}"
+    try:
+        r = subprocess.run(
+            [cmd, "-p", "--model", cfg.get("model", "claude-haiku-4-5-20251001")],
+            input=LLM_PROMPT + text, capture_output=True, text=True, timeout=90)
+        out = (r.stdout or "").strip().splitlines()
+        verdict = out[-1].strip() if out else ""
+        if verdict.upper().startswith("FAIL"):
+            return "exclude", verdict.partition(":")[2].strip() or "LLM: not credible for undergrad"
+        if verdict.upper().startswith("PASS"):
+            return "ok", ""
+        return "skip", f"unparseable verdict: {verdict[:40]}"
+    except Exception as e:
+        return "skip", str(e)[:60]
+
+
 # ---------------------------------------------------------------- storage
 
 def db_connect():
@@ -597,7 +647,7 @@ def cmd_run(seed=False):
         log(f"WARN source failed: {e}")
 
     inc, exc, boost, loc_re = compile_filters()
-    new_jobs = []
+    new_jobs, llm_calls = [], 0
     for job in jobs:
         tier = matches(job, inc, exc, boost, loc_re)
         if not tier or not job["url"]:
@@ -619,6 +669,13 @@ def cmd_run(seed=False):
             if verdict == "promote" and tier == "match":
                 log(f"DESC-PROMOTE {job['company']}: {job['title']} — {why}")
                 tier = "hot"
+            # third stage: LLM judge for seniority the regexes can't word-match
+            if llm_calls < CONFIG.get("llm_screen", {}).get("max_per_run", 10):
+                llm_calls += 1
+                lv, lwhy = llm_screen(job["title"], desc)
+                if lv == "exclude":
+                    log(f"LLM-SKIP {job['company']}: {job['title']} — {lwhy}")
+                    continue
         job["tier"] = tier
         hr = (job["company"] or "").lower() in HAND_REVIEW
         status = "needs_review" if hr else "new"
