@@ -1,6 +1,6 @@
 # JobScout
 
-A personal Scoutify: polls company job boards every minute (boards fetched in
+A personal job scouter: polls company job boards every minute (boards fetched in
 parallel, a full sweep takes a few seconds), notifies you the moment a matching
 job appears, and preps applications with your resume for one-click
 review-then-submit.
