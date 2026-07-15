@@ -128,6 +128,9 @@ details.more .menu button:hover { background:var(--card); }
 .toolbar button.apply { color:#fff; background:var(--accent); border-color:var(--accent);
   font-weight:700; }
 .toolbar button:disabled { opacity:.7; cursor:default; }
+.fit { display:inline-block; font-size:.72rem; font-weight:700; color:#7c5cff;
+  background:rgba(124,92,255,.14); border:1px solid rgba(124,92,255,.4);
+  border-radius:6px; padding:.05rem .4rem; margin-right:.4rem; white-space:nowrap; }
 .empty { color:var(--muted); text-align:center; padding:3rem 0; }
 footer { color:var(--muted); font-size:.78rem; text-align:center;
          padding:1rem; }
@@ -147,6 +150,7 @@ footer { color:var(--muted); font-size:.78rem; text-align:center;
     <button class="apply" onclick="applyAllReady(this)" title="assisted-apply every ready inbox job, one window at a time">🚀 Apply all ready</button>
     <button onclick="assistAll(this)" title="walk EVERY inbox + review job, one visible window at a time — quick wins first; you clear gates and click submit">🙋 Assist all</button>
     <button onclick="recheck(this)" title="re-grade readiness of all inbox/review jobs">🔄 Re-check readiness</button>
+    <button onclick="rankFits(this)" title="LLM-rank the best-fit jobs for you — type a company in search first to scope it (e.g. amazon)">🎯 Rank fits</button>
   </div>
 </header>
 <main id="list"></main>
@@ -195,6 +199,7 @@ function card(j) {
       ${logo(j)}
       <div class="body">
         <div class="top">
+          ${j.fit_rank ? `<span class="fit" title="${esc(j.fit_note||'')}">🎯 #${j.fit_rank} fit</span> ` : ""}
           <a class="title" href="${j.url}" target="_blank">${esc(j.title)}</a>
           ${chip(j)}
         </div>
@@ -292,6 +297,20 @@ async function applyNow(id, el) {
       el.textContent = "✅ window open — finish in browser";
     }
   } catch (e) { el.textContent = "⚠ failed"; el.disabled = false; }
+}
+async function rankFits(el) {
+  const company = (document.getElementById("q").value || "").trim();
+  el.disabled = true; el.textContent = "🎯 ranking…";
+  try {
+    const r = await fetch("/api/rank", {method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({company})});
+    const d = await r.json();
+    el.textContent = d.status === "already running"
+      ? "🎯 already running" : "🎯 ranking… (refresh soon)";
+  } catch { el.textContent = "🎯 failed"; }
+  setTimeout(() => { el.disabled = false; el.textContent = "🎯 Rank fits";
+    load(); }, 8000);
 }
 async function assistAll(el) {
   el.disabled = true; el.textContent = "🙋 launching…";
@@ -475,8 +494,13 @@ def resolve_logo(domain):
 def query_jobs(status, q):
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
+    for col in ("fit_rank INTEGER", "fit_note TEXT"):  # may predate rank feature
+        try:
+            con.execute(f"ALTER TABLE jobs ADD COLUMN {col}")
+        except sqlite3.OperationalError:
+            pass
     sql = ("SELECT id, source, company, title, location, url, tier, first_seen, "
-           "status, reason, readiness FROM jobs WHERE 1=1")
+           "status, reason, readiness, fit_rank, fit_note FROM jobs WHERE 1=1")
     params = []
     if status == "submitted":
         sql += " AND status IN ('applied', 'auto_applied')"
@@ -630,6 +654,21 @@ class Handler(BaseHTTPRequestHandler):
                 [str(VENV_PY), str(BASE / "auto_apply.py"), "--all", "--assist",
                  "--ready-only"], cwd=str(BASE), stdout=logf, stderr=logf)
             self.send(200, json.dumps({"status": "launching", "count": count}))
+            return
+
+        if self.path == "/api/rank":
+            b = BATCH.get("rank")
+            if b and b.poll() is None:
+                self.send(200, json.dumps({"status": "already running"}))
+                return
+            company = (body.get("company") or "").strip()
+            cmd = [str(VENV_PY), str(BASE / "scout.py"), "rank", "--top=3"]
+            if company:
+                cmd.append(f"--company={company}")
+            logf = open(BASE / "logs" / "rank.log", "a")
+            BATCH["rank"] = subprocess.Popen(cmd, cwd=str(BASE),
+                                             stdout=logf, stderr=logf)
+            self.send(200, json.dumps({"status": "launching"}))
             return
 
         if self.path == "/api/assist_all":

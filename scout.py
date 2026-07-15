@@ -425,9 +425,9 @@ Posting follows:
 """
 
 
-def _llm_via_api(prompt, model, api_key):
+def _llm_via_api(prompt, model, api_key, max_tokens=50):
     """Direct Anthropic API call — portable to any machine / CI with a key."""
-    body = json.dumps({"model": model, "max_tokens": 50,
+    body = json.dumps({"model": model, "max_tokens": max_tokens,
                        "messages": [{"role": "user", "content": prompt}]})
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/messages", data=body.encode(),
@@ -445,6 +445,21 @@ def _llm_via_cli(prompt, model, cmd):
     return r.stdout or ""
 
 
+def llm_complete(prompt, max_tokens=50):
+    """Raw LLM completion via API key (anywhere) or local claude CLI.
+    Raises on no-backend / transport error; callers decide fail-open."""
+    cfg = CONFIG.get("llm_screen", {})
+    model = cfg.get("model", "claude-haiku-4-5-20251001")
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    cmd = cfg.get("command", "claude")
+    if api_key:
+        return _llm_via_api(prompt, model, api_key, max_tokens)
+    if Path(cmd).exists() or subprocess.run(
+            ["which", cmd], capture_output=True).returncode == 0:
+        return _llm_via_cli(prompt, model, cmd)
+    raise RuntimeError("no ANTHROPIC_API_KEY and no claude CLI")
+
+
 def llm_screen(title, desc):
     """('ok'|'exclude'|'skip', why) — final judge on posts the regexes pass.
     Uses ANTHROPIC_API_KEY when set (works anywhere, incl. CI), else the
@@ -452,19 +467,10 @@ def llm_screen(title, desc):
     cfg = CONFIG.get("llm_screen", {})
     if not cfg.get("enabled") or not desc:
         return "skip", ""
-    model = cfg.get("model", "claude-haiku-4-5-20251001")
     prompt = (LLM_PROMPT + f"TITLE: {title}\n\n"
               + desc[:cfg.get("max_desc_chars", 6000)])
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    cmd = cfg.get("command", "claude")
     try:
-        if api_key:
-            raw = _llm_via_api(prompt, model, api_key)
-        elif Path(cmd).exists() or subprocess.run(
-                ["which", cmd], capture_output=True).returncode == 0:
-            raw = _llm_via_cli(prompt, model, cmd)
-        else:
-            return "skip", "no ANTHROPIC_API_KEY and no claude CLI"
+        raw = llm_complete(prompt)
         out = raw.strip().splitlines()
         verdict = out[-1].strip() if out else ""
         if verdict.upper().startswith("FAIL"):
@@ -824,6 +830,133 @@ def cmd_cloud():
         f"source errors {len(errors)}")
 
 
+def full_description(source, company, url):
+    """Best-effort full description for a stored job (has url, not ext_id).
+    Covers every source; '' when unavailable."""
+    try:
+        if source == "amazon":
+            m = re.search(r"/jobs/(\d+)", url)
+            if not m:
+                return ""
+            d = get_json(f"https://www.amazon.jobs/en/jobs/{m.group(1)}.json",
+                         headers=BROWSER_UA)
+            j = d.get("job", {})
+            return strip_html(" ".join(filter(None, (
+                j.get("description"), j.get("basic_qualifications"),
+                j.get("preferred_qualifications")))))
+        if source == "greenhouse":
+            m = re.search(r"(\d{6,})", url)
+            if not m:
+                return ""
+            d = get_json("https://boards-api.greenhouse.io/v1/boards/"
+                         f"{company}/jobs/{m.group(1)}")
+            return strip_html(html.unescape(d.get("content", "")))
+        if source == "netflix":
+            return get_description({"source": "netflix", "url": url})
+        if source == "apple":
+            return strip_html(get(url, headers=BROWSER_UA).decode("utf-8", "replace"))
+        if source == "google":
+            raw = get(url, headers=BROWSER_UA).decode()
+            m = GOOGLE_DATA_RE.search(raw)
+            if m:
+                rec = json.loads(m.group(1))[0][0]
+                return strip_html(" ".join((f or [None, ""])[1] or ""
+                                           for f in (rec[3], rec[4])))
+        if source == "lever":
+            m = re.search(r"jobs\.lever\.co/[^/]+/([0-9a-f-]{36})", url)
+            if m:
+                d = get_json(f"https://api.lever.co/v0/postings/{company}/{m.group(1)}")
+                return strip_html(d.get("descriptionPlain", ""))
+        if source == "ashby":
+            d = get_json("https://api.ashbyhq.com/posting-api/job-board/"
+                         f"{company}")
+            for j in d.get("jobs", []):
+                if (j.get("jobUrl") or "").rstrip("/").split("?")[0] == \
+                        url.rstrip("/").split("?")[0]:
+                    return strip_html(j.get("descriptionPlain", ""))
+    except Exception:
+        return ""
+    return ""
+
+
+RANK_PROMPT = """You are helping Justin decide which few jobs to actually \
+apply to. Applying to many near-identical roles at one company looks \
+scattershot, so he wants the {top} that BEST fit him — where he's both \
+competitive AND genuinely well-matched.
+
+Justin: Cornell undergrad, B.S. Biometry & Statistics (expected May 2028), \
+~1 year as a data-analytics intern. Strengths: SQL, statistics, analytics, \
+dashboards, experimentation. Seeking internships / entry-level data & \
+analytics roles. Weaker fit: heavy software/ML-infra engineering, deep \
+domain specialties, roles clearly wanting years of experience.
+
+Below are {n} postings (numbered). Return ONLY a JSON array of the top {top}, \
+best first:
+[{{"n": <number>, "score": <0-100 fit>, "why": "<=15 words"}}]
+
+Postings:
+"""
+
+
+def cmd_rank(company_filter=None, top=3):
+    """LLM-rank the visible jobs (optionally one company) by fit for Justin,
+    store fit_rank/fit_note, and print the top picks. Runs wherever an
+    LLM backend is reachable (API key anywhere, or local claude CLI)."""
+    con = db_connect()
+    for col in ("fit_rank INTEGER", "fit_note TEXT"):
+        try:
+            con.execute(f"ALTER TABLE jobs ADD COLUMN {col}")
+        except sqlite3.OperationalError:
+            pass
+    sql = "SELECT id, source, company, title, url FROM jobs WHERE status IN ('new','needs_review')"
+    params = []
+    if company_filter:
+        sql += " AND lower(company)=?"
+        params.append(company_filter.lower())
+    rows = con.execute(sql, params).fetchall()
+    if not rows:
+        log(f"rank: no visible jobs{' for ' + company_filter if company_filter else ''}")
+        con.close()
+        return
+    log(f"rank: fetching {len(rows)} descriptions…")
+    cands = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        descs = pool.map(lambda r: full_description(r[1], r[2], r[4]), rows)
+    for r, d in zip(rows, descs):
+        cands.append((r[0], r[3], d))
+
+    listing = "\n\n".join(
+        f"[{i+1}] {title}\n{(desc or '(no description)')[:900]}"
+        for i, (_, title, desc) in enumerate(cands))
+    prompt = RANK_PROMPT.format(top=top, n=len(cands)) + listing
+    try:
+        raw = llm_complete(prompt, max_tokens=600)
+        m = re.search(r"\[.*\]", raw, re.S)
+        picks = json.loads(m.group(0)) if m else []
+    except Exception as e:
+        log(f"rank: LLM error — {e}")
+        con.close()
+        return
+
+    con.execute("UPDATE jobs SET fit_rank=NULL WHERE status IN ('new','needs_review')"
+                + (" AND lower(company)=?" if company_filter else ""),
+                params)
+    print(f"\nTop {min(top, len(picks))} fits"
+          f"{' at ' + company_filter if company_filter else ''} for Justin:\n")
+    for rank, p in enumerate(picks[:top], 1):
+        idx = p.get("n", 0) - 1
+        if not (0 <= idx < len(cands)):
+            continue
+        jid, title, _ = cands[idx]
+        note = f"{p.get('score', '?')}/100 — {p.get('why', '')}"
+        con.execute("UPDATE jobs SET fit_rank=?, fit_note=? WHERE id=?",
+                    (rank, note, jid))
+        print(f"  {rank}. {title}\n     {note}\n")
+    con.commit()
+    con.close()
+    log(f"rank: tagged top {min(top, len(picks))} with fit_rank")
+
+
 def cmd_list(n=20):
     con = db_connect()
     rows = con.execute(
@@ -857,6 +990,15 @@ def main():
         cmd_run(seed="--seed" in args)
     elif cmd == "cloud":
         cmd_cloud()
+    elif cmd == "rank":
+        company = None
+        top = 3
+        for a in args[1:]:
+            if a.startswith("--company="):
+                company = a.split("=", 1)[1]
+            elif a.startswith("--top="):
+                top = int(a.split("=", 1)[1])
+        cmd_rank(company_filter=company, top=top)
     elif cmd == "list":
         cmd_list(int(args[1]) if len(args) > 1 else 20)
     elif cmd == "test-notify":
