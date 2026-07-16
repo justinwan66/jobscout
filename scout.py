@@ -910,7 +910,11 @@ def cmd_cloud():
         seen.add(jid)
         seen_list.append(jid)
         try:
-            desc = get_description(job)
+            # match the local poller: fall back to full_description so custom
+            # boards whose listing has no description (Amazon) still get
+            # screened, instead of passing on the title alone.
+            desc = get_description(job) or full_description(
+                job["source"], job["company"], job["url"])
         except Exception:
             desc = ""
         if desc:
