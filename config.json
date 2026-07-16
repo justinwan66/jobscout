@@ -273,12 +273,13 @@
   "notify": {
     "macos_notification": true,
     "email": {
-      "enabled": false,
+      "enabled": true,
+      "send_from": "cloud",
       "to": "jlw447@cornell.edu",
-      "from": "jlw447@cornell.edu",
+      "from": "justinwan2006@gmail.com",
       "smtp_host": "smtp.gmail.com",
       "smtp_port": 587,
-      "smtp_user": "jlw447@cornell.edu",
+      "smtp_user": "justinwan2006@gmail.com",
       "smtp_password_env": "JOBSCOUT_SMTP_PASSWORD"
     },
     "max_individual_notifications": 5,

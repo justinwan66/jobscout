@@ -13,6 +13,7 @@ Usage:
   python3 scout.py test-notify    # fire a test macOS notification / email
 """
 
+import gzip
 import html
 import json
 import os
@@ -37,9 +38,15 @@ CONFIG = json.loads((BASE / "config.json").read_text())
 DB_PATH = BASE / "jobs.db"
 LOG_PATH = BASE / "logs" / "scout.log"
 
+def company_key(s):
+    """Normalize a company name so an ATS 'Scale AI' matches config 'scaleai'
+    — same rule the auto-apply hand-review gate uses, so routing stays in sync."""
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
 # high-profile companies land straight in the Review bin (auto-fill on demand,
 # you review + submit) instead of the auto-apply inbox
-HAND_REVIEW = {c.lower() for c in
+HAND_REVIEW = {company_key(c) for c in
                CONFIG.get("auto_apply", {}).get("hand_review_companies", [])}
 
 SSL_CTX = ssl.create_default_context()
@@ -58,9 +65,17 @@ def log(msg):
 
 
 def get(url, timeout=15, headers=None):
-    req = urllib.request.Request(url, headers=headers or UA)
+    # request gzip: the biggest boards (Anduril ~2.3MB, SpaceX) stream multi-MB
+    # bodies uncompressed and trip the read timeout under the parallel sweep;
+    # gzipped they are ~18x smaller. urllib does NOT auto-decompress, so do it.
+    hdrs = dict(headers or UA)
+    hdrs.setdefault("Accept-Encoding", "gzip")
+    req = urllib.request.Request(url, headers=hdrs)
     with urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX) as r:
-        return r.read()
+        data = r.read()
+        if data and r.headers.get("Content-Encoding", "").lower() == "gzip":
+            data = gzip.decompress(data)
+        return data
 
 
 def get_json(url, timeout=15, headers=None):
@@ -69,6 +84,15 @@ def get_json(url, timeout=15, headers=None):
 
 def strip_html(s):
     return re.sub(r"<[^>]+>", " ", html.unescape(s or ""))
+
+
+def _amazon_date(s):
+    """Amazon posts a human date like 'July 14, 2026' -> ISO 8601, or None."""
+    try:
+        return datetime.strptime(s, "%B %d, %Y").replace(
+            tzinfo=timezone.utc).isoformat()
+    except (ValueError, TypeError):
+        return None
 
 
 # ---------------------------------------------------------------- sources
@@ -82,6 +106,7 @@ def fetch_greenhouse(slug):
             "title": j.get("title", ""),
             "location": (j.get("location") or {}).get("name", ""),
             "url": j.get("absolute_url", ""),
+            "posted_at": j.get("first_published") or j.get("updated_at"),
             "ext_id": j.get("id"),
         }
 
@@ -95,6 +120,8 @@ def fetch_lever(slug):
             "title": j.get("text", ""),
             "location": (j.get("categories") or {}).get("location", "") or "",
             "url": j.get("hostedUrl", ""),
+            "posted_at": (datetime.fromtimestamp(j["createdAt"] / 1000,
+                          timezone.utc).isoformat() if j.get("createdAt") else None),
             "description": j.get("descriptionPlain", "") + " " + " ".join(
                 strip_html(sec.get("content", "")) for sec in j.get("lists", [])),
         }
@@ -111,6 +138,7 @@ def fetch_ashby(slug):
             "title": j.get("title", ""),
             "location": j.get("location", "") or "",
             "url": j.get("jobUrl", "") or j.get("applyUrl", ""),
+            "posted_at": j.get("publishedAt"),
             "description": j.get("descriptionPlain", ""),
         }
 
@@ -131,6 +159,7 @@ def fetch_smartrecruiters(slug):
                 "title": j.get("name", ""),
                 "location": ", ".join(p for p in parts if p),
                 "url": f"https://jobs.smartrecruiters.com/{slug}/{j.get('id')}",
+                "posted_at": j.get("releasedDate"),
                 "ext_id": j.get("id"),
             }
         offset += 100
@@ -147,6 +176,7 @@ def fetch_remotive():
             "title": j.get("title", ""),
             "location": j.get("candidate_required_location", "") or "Remote",
             "url": j.get("url", ""),
+            "posted_at": j.get("publication_date"),
             "description": j.get("description", ""),
         }
 
@@ -199,6 +229,7 @@ def fetch_amazon(query):
             "title": j.get("title", ""),
             "location": j.get("normalized_location") or j.get("location", ""),
             "url": "https://www.amazon.jobs" + (j.get("job_path") or ""),
+            "posted_at": _amazon_date(j.get("posted_date")),
             # no description here: the search teaser proved unreliable (missed
             # full qualifications). get_description falls through to
             # full_description(), which parses the complete HTML posting.
@@ -490,13 +521,18 @@ def llm_screen(title, desc):
 # ---------------------------------------------------------------- storage
 
 def db_connect():
-    con = sqlite3.connect(DB_PATH)
+    # WAL + a generous busy_timeout so the poller no longer crashes with
+    # "database is locked" when a spawned writer (reconcile/precheck) or the
+    # dashboard holds the write lock longer than the old 5s default.
+    con = sqlite3.connect(DB_PATH, timeout=30)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=30000")
     con.execute("""CREATE TABLE IF NOT EXISTS jobs (
         id TEXT PRIMARY KEY, source TEXT, company TEXT, title TEXT,
         location TEXT, url TEXT, tier TEXT, first_seen TEXT, status TEXT DEFAULT 'new')""")
     con.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
     for col in ("reason TEXT", "applied_at TEXT",
-                "readiness TEXT", "readiness_at TEXT"):
+                "readiness TEXT", "readiness_at TEXT", "posted_at TEXT"):
         try:
             con.execute(f"ALTER TABLE jobs ADD COLUMN {col}")
         except sqlite3.OperationalError:
@@ -523,6 +559,13 @@ def notify_email(new_jobs):
     if not cfg.get("enabled"):
         return
     import os
+    # send_from gates which poller emails (mirrors ntfy) so the local and cloud
+    # pollers don't both email. 'cloud' = only the 24/7 GitHub Actions poller
+    # emails, which is what gives coverage while the Mac is asleep/off.
+    is_cloud = os.environ.get("JOBSCOUT_CLOUD") == "1"
+    mode = cfg.get("send_from", "cloud")
+    if (mode == "cloud" and not is_cloud) or (mode == "local" and is_cloud):
+        return
     password = os.environ.get(cfg["smtp_password_env"], "")
     if not password:
         log(f"email skipped: {cfg['smtp_password_env']} not set")
@@ -588,6 +631,12 @@ def notify_ntfy(new_jobs):
 CUSTOM_FETCHERS = {"amazon": fetch_amazon, "google": fetch_google,
                    "netflix": fetch_netflix, "apple": fetch_apple}
 
+# search-based big-tech boards repost the same role under a new URL (Amazon
+# reposts sequentially) and surface one role under several query terms. job_id
+# is a URL hash, so it treats each as new — dedup these by (source, company,
+# title) instead. Full-listing ATS boards don't need this.
+DEDUP_BY_TITLE = {"amazon", "google", "netflix", "apple"}
+
 
 def collect_jobs(include_broad, include_custom=False):
     jobs, errors = [], []
@@ -628,12 +677,16 @@ def collect_jobs(include_broad, include_custom=False):
         except Exception as e:
             return [], f"{name}: {e}"
 
+    empties = []
     with ThreadPoolExecutor(max_workers=10) as pool:
-        for result, err in pool.map(run_task, tasks):
+        for (name, _fn), (result, err) in zip(tasks, pool.map(run_task, tasks)):
             jobs.extend(result)
             if err:
                 errors.append(err)
-    return jobs, errors
+            elif not result and name.split(":", 1)[0] in (
+                    "greenhouse", "lever", "ashby", "smartrecruiters"):
+                empties.append(name)   # 0 jobs from a full-listing board = dead slug
+    return jobs, errors, empties
 
 
 def expire_stale(con):
@@ -674,13 +727,35 @@ def cmd_run(seed=False):
     custom_due = due("last_custom_poll",
                      CONFIG.get("custom_boards", {}).get("poll_every_minutes", 15))
 
-    jobs, errors = collect_jobs(include_broad=broad_due, include_custom=custom_due)
+    jobs, errors, empties = collect_jobs(include_broad=broad_due,
+                                         include_custom=custom_due)
     for flag, key in ((broad_due, "last_broad_poll"),
                       (custom_due, "last_custom_poll")):
         if flag:
             con.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)", (key, str(now)))
     for e in errors:
         log(f"WARN source failed: {e}")
+    # persistent-empty detection: a one-off 0 is just a quiet board, but a
+    # full-listing board that returns 0 for many polls in a row means the slug
+    # broke (company changed ATS, etc.). Warn once per episode, not every poll.
+    ZERO_WARN_STREAK = 30
+    ats_boards = [f"{ats}:{s}" for ats in
+                  ("greenhouse", "lever", "ashby", "smartrecruiters")
+                  for s in CONFIG["boards"].get(ats, [])]
+    srow = con.execute(
+        "SELECT value FROM meta WHERE key='board_zero_streak'").fetchone()
+    try:
+        prev = json.loads(srow[0]) if srow else {}
+    except (ValueError, TypeError):
+        prev = {}
+    empty_set = set(empties)
+    streak = {b: (prev.get(b, 0) + 1 if b in empty_set else 0) for b in ats_boards}
+    con.execute("INSERT OR REPLACE INTO meta VALUES ('board_zero_streak', ?)",
+                (json.dumps(streak),))
+    crossed = sorted(b for b in ats_boards if streak[b] == ZERO_WARN_STREAK)
+    if crossed:
+        log(f"WARN {len(crossed)} board(s) empty for {ZERO_WARN_STREAK}+ polls "
+            f"(dead slug? check config): {', '.join(crossed)}")
 
     inc, exc, boost, loc_re = compile_filters()
     new_jobs, llm_calls = [], 0
@@ -690,6 +765,13 @@ def cmd_run(seed=False):
             continue
         jid = job_id(job)
         if con.execute("SELECT 1 FROM jobs WHERE id=?", (jid,)).fetchone():
+            continue
+        # collapse big-tech reposts / cross-query duplicates that job_id misses
+        # (same role, new url). Seen even if the prior copy was hidden/expired,
+        # so we don't re-alert or re-screen the same posting.
+        if job["source"] in DEDUP_BY_TITLE and con.execute(
+                "SELECT 1 FROM jobs WHERE source=? AND company=? AND title=?",
+                (job["source"], job["company"], job["title"])).fetchone():
             continue
 
         def record_excluded(reason):
@@ -731,15 +813,15 @@ def cmd_run(seed=False):
                     record_excluded(f"llm-screen: {lwhy}")
                     continue
         job["tier"] = tier
-        hr = (job["company"] or "").lower() in HAND_REVIEW
+        hr = company_key(job["company"]) in HAND_REVIEW
         status = "needs_review" if hr else "new"
         reason = "high-profile — review & submit" if hr else None
         con.execute(
             "INSERT INTO jobs (id, source, company, title, location, url, tier, "
-            "first_seen, status, reason) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "first_seen, status, reason, posted_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (jid, job["source"], job["company"], job["title"], job["location"],
              job["url"], tier, datetime.now(timezone.utc).isoformat(),
-             status, reason))
+             status, reason, job.get("posted_at")))
         new_jobs.append(job)
     con.commit()
 
@@ -753,7 +835,7 @@ def cmd_run(seed=False):
     # company — those are the postings where being early matters most;
     # remaining full-time matches land silently in the dashboard
     def is_hr(j):
-        return (j["company"] or "").lower() in HAND_REVIEW
+        return company_key(j["company"]) in HAND_REVIEW
     alert_jobs = [j for j in new_jobs if j["tier"] == "hot" or is_hr(j)]
     if alert_jobs:
         cap = CONFIG["notify"]["max_individual_notifications"]
@@ -812,7 +894,7 @@ def cmd_cloud():
     seen = set(seen_list)
     first_run = not seen
 
-    jobs, errors = collect_jobs(include_broad=False, include_custom=True)
+    jobs, errors, _empties = collect_jobs(include_broad=False, include_custom=True)
     for e in errors:
         log(f"WARN source failed: {e}")
 
@@ -845,6 +927,10 @@ def cmd_cloud():
     if new_jobs and not first_run:
         os.environ["JOBSCOUT_CLOUD"] = "1"
         notify_ntfy(new_jobs)
+        try:
+            notify_email(new_jobs)   # 24/7 email digest (send_from='cloud')
+        except Exception as e:
+            log(f"WARN cloud email failed: {e}")
     state_path.write_text(json.dumps(
         {"seen": seen_list[-8000:]}))  # cap growth; drops oldest first
     log(f"cloud run: scanned {len(jobs)}, new {len(new_jobs)}"

@@ -12,6 +12,7 @@ Usage:
   .venv/bin/python auto_apply.py <job_db_id | url> --dry-run  # everything except the submit click
 """
 
+import fcntl
 import json
 import os
 import re
@@ -33,6 +34,30 @@ if isinstance(FOS, str):
 DB_PATH = BASE / "jobs.db"
 SHOTS = BASE / "logs" / "apps"
 APP_LOG = BASE / "logs" / "applications.log"
+
+
+def _connect(timeout=30):
+    """SQLite connection with WAL + busy_timeout so the poller, dashboard, and
+    this engine don't crash each other with 'database is locked'."""
+    con = sqlite3.connect(DB_PATH, timeout=timeout)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=30000")
+    return con
+
+
+def _flock(name):
+    """Non-blocking single-instance lock across processes. Returns the open file
+    handle if acquired (keep it alive for the lock's lifetime), else None — used
+    so the every-60s poller can't stack overlapping reconcile/precheck runs."""
+    (BASE / "logs").mkdir(exist_ok=True)
+    f = open(BASE / "logs" / f".{name}.lock", "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return f
+    except OSError:
+        f.close()
+        return None
+
 
 BROWSER_ARGS = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
                 "--disable-extensions"]
@@ -149,14 +174,19 @@ def fetch_verification_code(since_epoch=0):
     import imaplib
     import email
     from email.utils import parsedate_to_datetime
+    M = None
     try:
-        M = imaplib.IMAP4_SSL(c["imap_host"], c.get("imap_port", 993))
+        M = imaplib.IMAP4_SSL(c["imap_host"], c.get("imap_port", 993), timeout=30)
         M.login(c["user"], pw)
         M.select("INBOX")
-        _, data = M.search(None, "ALL")
+        _, data = M.uid("search", None, "ALL")
         best = None
-        for i in reversed(data[0].split()[-8:]):  # newest few
-            _, md = M.fetch(i, "(RFC822)")
+        for uid in reversed(data[0].split()[-8:]):  # newest few
+            uid_s = uid.decode() if isinstance(uid, bytes) else str(uid)
+            # BODY.PEEK: don't mark the message \Seen just to read a code.
+            _, md = M.uid("fetch", uid_s, "(BODY.PEEK[])")
+            if not md or not isinstance(md[0], tuple) or len(md[0]) < 2:
+                continue
             msg = email.message_from_bytes(md[0][1])
             try:
                 ts = parsedate_to_datetime(msg.get("Date")).timestamp()
@@ -174,11 +204,16 @@ def fetch_verification_code(since_epoch=0):
             code = _extract_code(body)
             if code and (best is None or ts > best[1]):
                 best = (code, ts)
-        M.logout()
         return best[0] if best else None
     except Exception as e:
         log(f"code-inbox error: {e}")
         return None
+    finally:
+        if M is not None:
+            try:
+                M.logout()
+            except Exception:
+                pass
 
 
 def enter_verification_code(page, code):
@@ -236,7 +271,7 @@ def reconcile_from_inbox():
         return 0
     import imaplib
     import email
-    con = sqlite3.connect(DB_PATH, timeout=30)
+    con = _connect()
     jobs = con.execute(
         "SELECT id, company, title FROM jobs "
         "WHERE status IN ('new','needs_review')").fetchall()
@@ -281,49 +316,93 @@ def reconcile_from_inbox():
                 pass
         return "\n".join(parts)
 
+    # company key that ignores spacing/punctuation so "Scale AI" == "scaleai"
+    def cnorm(s):
+        return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+    def title_match(role, jtitle):
+        r, j = norm(role), norm(jtitle)
+        if not r or not j:
+            return False
+        if r == j:
+            return True
+        # tolerate one side carrying a trailing ", <team/location>" the other
+        # omits, but require the shorter to be a specific (>=12 char) full prefix
+        short, lng = (r, j) if len(r) <= len(j) else (j, r)
+        return (len(short) >= 12 and lng.startswith(short)
+                and lng[len(short):len(short) + 1] in (" ", ","))
+
+    # act on each confirmation email ONCE. The old code re-scanned the last 40
+    # messages every run, so one generic-titled email kept re-attaching to
+    # different same-family postings across runs (the Pinterest cascade).
+    con.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+    srow = con.execute(
+        "SELECT value FROM meta WHERE key='reconcile_seen_uids'").fetchone()
     try:
-        M = imaplib.IMAP4_SSL(c["imap_host"], c.get("imap_port", 993))
+        seen_uids = set(json.loads(srow[0])) if srow else set()
+    except (ValueError, TypeError):
+        seen_uids = set()
+
+    M = None
+    try:
+        M = imaplib.IMAP4_SSL(c["imap_host"], c.get("imap_port", 993), timeout=30)
         M.login(c["user"], pw)
         M.select("INBOX")
-        _, data = M.search(None, "ALL")
+        _, data = M.uid("search", None, "ALL")            # UIDs are stable
         now = datetime.now(timezone.utc).isoformat()
-        for i in reversed(data[0].split()[-40:]):
-            _, md = M.fetch(i, "(RFC822)")
+        for uid in reversed(data[0].split()[-40:]):
+            uid_s = uid.decode() if isinstance(uid, bytes) else str(uid)
+            if uid_s in seen_uids:
+                continue
+            # BODY.PEEK: read without setting \Seen, so the verification-code
+            # fetcher still sees the mail as unread.
+            _, md = M.uid("fetch", uid_s, "(BODY.PEEK[])")
+            if not md or not isinstance(md[0], tuple) or len(md[0]) < 2:
+                continue
             msg = email.message_from_bytes(md[0][1])
+            seen_uids.add(uid_s)          # examined once; never revisit
             subj = str(msg.get("Subject", ""))
             if not re.search(r"appl(ication|ied|y)|thank you for applying", subj, re.I):
                 continue
             role, ecomp = parse_subject(subj)
             if not ecomp:
                 ecomp = company_from_body(email_text(msg))
-            # best match: same company AND strong title overlap (longest wins)
-            best = None
-            for jid, comp, title in jobs:
-                cl = (comp or "").lower()
-                tl = norm(title)
-                if not tl:
-                    continue
-                comp_ok = bool(ecomp) and (ecomp == cl or ecomp in cl or cl in ecomp)
-                if not comp_ok:
-                    continue
-                # require the full role/title to line up, not a generic substring
-                if role.startswith(tl) or tl.startswith(role) or role == tl:
-                    if best is None or len(tl) > len(best[2]):
-                        best = (jid, comp, tl, title)
-            if best:
-                cur = con.execute(
-                    "UPDATE jobs SET status='applied', reason='confirmed by email', "
-                    "applied_at=? WHERE id=? AND status IN ('new','needs_review')",
-                    (now, best[0]))
-                if cur.rowcount:
-                    marked += 1
-                    log(f"RECONCILE: {best[1]}: {best[3]} -> confirmed by email")
-                    notify_confirmation(best[1], best[3])
+            ec = cnorm(ecomp)
+            if not ec:
+                continue                  # no company => too risky to attribute
+            # candidates: exact-normalized company AND a confident title match
+            cands = [(jid, comp, title) for jid, comp, title in jobs
+                     if cnorm(comp) == ec and title_match(role, title)]
+            # exactly one => confident. 0 => nothing to do. 2+ => ambiguous
+            # (near-identical roles at one company): DON'T guess — leave it for
+            # the human. This is what stops one email marking a whole family.
+            if len(cands) != 1:
+                if len(cands) > 1:
+                    log(f"RECONCILE ambiguous ({len(cands)} matches) for "
+                        f"'{subj[:60]}' — left for manual review")
+                continue
+            jid, comp, title = cands[0]
+            cur = con.execute(
+                "UPDATE jobs SET status='applied', reason='confirmed by email', "
+                "applied_at=? WHERE id=? AND status IN ('new','needs_review')",
+                (now, jid))
+            if cur.rowcount:
+                marked += 1
+                log(f"RECONCILE: {comp}: {title} -> confirmed by email")
+                notify_confirmation(comp, title)
+        con.execute(
+            "INSERT OR REPLACE INTO meta VALUES ('reconcile_seen_uids', ?)",
+            (json.dumps(sorted(
+                seen_uids, key=lambda x: int(x) if x.isdigit() else 0)[-1000:]),))
         con.commit()
-        M.logout()
     except Exception as e:
         log(f"reconcile error: {e}")
     finally:
+        if M is not None:
+            try:
+                M.logout()
+            except Exception:
+                pass
         con.close()
     log(f"reconcile: marked {marked} job(s) as submitted from inbox confirmations")
     return marked
@@ -353,7 +432,8 @@ def detected_gate(page):
             "confirm you're a human" in body or "security code" in body:
         return "email verification code"
     if page.locator(".h-captcha, iframe[src*='hcaptcha'], .cf-turnstile, "
-                    ".g-recaptcha").count():
+                    ".g-recaptcha, iframe[src*='arkoselabs'], "
+                    "iframe[src*='funcaptcha'], iframe[src*='datadome']").count():
         return "CAPTCHA challenge"
     return "final human check"
 
@@ -363,6 +443,28 @@ def log(msg):
     print(line)
     with open(APP_LOG, "a") as f:
         f.write(line + "\n")
+
+
+def prune_logs(keep_shots=300, max_app_log_mb=5):
+    """Bound local disk use (logs/ is gitignored): keep only the most-recent
+    screenshots and cap the application log. Called from batch entry points,
+    not the per-minute poller."""
+    try:
+        shots = sorted(SHOTS.glob("*.png"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+        for p in shots[keep_shots:]:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+    except Exception:
+        pass
+    try:
+        cap = max_app_log_mb * 1024 * 1024
+        if APP_LOG.exists() and APP_LOG.stat().st_size > cap:
+            APP_LOG.write_bytes(APP_LOG.read_bytes()[-cap // 2:])
+    except Exception:
+        pass
 
 
 def notify(title, message):
@@ -845,8 +947,12 @@ def find_blockers(page):
     """Return list of reasons this application can't be safely submitted."""
     reasons = []
     # hCaptcha / Cloudflare Turnstile are interactive -> always a hard block.
-    if page.locator(".h-captcha, iframe[src*='hcaptcha'], .cf-turnstile").count():
-        reasons.append("CAPTCHA present (hcaptcha/turnstile)")
+    if page.locator(
+            ".h-captcha, iframe[src*='hcaptcha'], .cf-turnstile, "
+            "iframe[src*='challenges.cloudflare.com'], "
+            "iframe[src*='arkoselabs'], iframe[src*='funcaptcha'], "
+            "iframe[src*='datadome'], iframe[src*='captcha-delivery.com']").count():
+        reasons.append("CAPTCHA present (hcaptcha/turnstile/arkose/datadome)")
     # reCAPTCHA: only the VISIBLE checkbox variant blocks. Invisible v2/v3
     # (used by Greenhouse/Ashby) scores traffic in the background and needs no
     # user interaction, so it should not force every form into manual review.
@@ -856,7 +962,7 @@ def find_blockers(page):
             if (widgets.some(e => (e.getAttribute('data-size') || 'normal') !== 'invisible'))
                 return true;
             // a rendered, on-screen checkbox anchor iframe
-            return Array.from(document.querySelectorAll("iframe[src*='recaptcha/api2/anchor']"))
+            return Array.from(document.querySelectorAll("iframe[src*='recaptcha/api2/anchor'], iframe[src*='recaptcha/enterprise/anchor']"))
                 .some(f => f.offsetParent !== null && f.getBoundingClientRect().height > 20);
         }""")
         if interactive_recaptcha:
@@ -915,26 +1021,36 @@ def find_blockers(page):
 
 def company_throttled(con, company):
     cap = CONFIG.get("auto_apply", {}).get("max_per_company_per_week", 5)
+    # count ALL submissions this week, not just auto_applied — assisted/manual
+    # applies also count against the per-company cap (the old query counted only
+    # 'auto_applied', so with 0 of those the cap never engaged).
     n = con.execute(
-        "SELECT COUNT(*) FROM jobs WHERE company=? AND status='auto_applied' "
+        "SELECT COUNT(*) FROM jobs WHERE company=? "
+        "AND status IN ('applied','auto_applied') "
         "AND applied_at > datetime('now', '-7 days')", (company,)).fetchone()[0]
     return n >= cap
 
 
+def company_key(s):
+    """Normalize a company name for gate matching: lowercase and drop spacing
+    and punctuation, so an ATS 'Scale AI' matches a config slug 'scaleai'."""
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
 def hand_review_set():
-    return {c.lower() for c in CONFIG.get("auto_apply", {}).get(
+    return {company_key(c) for c in CONFIG.get("auto_apply", {}).get(
         "hand_review_companies", [])}
 
 
 def is_hand_review(company):
-    return (company or "").lower() in hand_review_set()
+    return company_key(company) in hand_review_set()
 
 
 def manual_apply_set():
     """Companies that block automation / require SSO sign-in (Amazon, Google,
     Apple…). Assist opens these in the user's real Chrome instead of the
     controlled browser, where SSO works and the extension can autofill."""
-    return {c.lower() for c in CONFIG.get("auto_apply", {}).get(
+    return {company_key(c) for c in CONFIG.get("auto_apply", {}).get(
         "manual_apply_companies", [])}
 
 
@@ -999,25 +1115,42 @@ def resolve_apply_url(source, company, url):
 def run(job_ref, dry_run=False, browser=None, assist=False, review=False,
         precheck=False, batch=False):
     visible = assist or review          # a human is watching this window
-    con = sqlite3.connect(DB_PATH, timeout=30)  # tolerate concurrent shard writes
+    con = _connect()  # tolerate concurrent shard writes
     row = con.execute(
-        "SELECT id, company, title, url, source FROM jobs WHERE id=? OR url=?",
-        (job_ref, job_ref)).fetchone()
+        "SELECT id, company, title, url, source, status FROM jobs "
+        "WHERE id=? OR url=?", (job_ref, job_ref)).fetchone()
     if not row:
         print(f"job not found in db: {job_ref}")
+        con.close()
         return 1
-    jid, company, title, url, source = row
+    jid, company, title, url, source, cur_status = row
+
+    # idempotency: a job that already went through is never re-submitted or
+    # re-opened (the dashboard could still point us at one; batches never
+    # should). dry-run/precheck only inspect a form, so they may still proceed.
+    if cur_status in ("applied", "auto_applied") and not dry_run and not precheck:
+        log(f"SKIP {company}: {title} — already {cur_status}, not re-applying")
+        con.close()
+        return 0
 
     def finish(status, reason=""):
         # dry-run never mutates the DB — it only reports what would happen.
         if dry_run:
             con.close()
             return
-        con.execute("UPDATE jobs SET status=?, reason=?, applied_at=? WHERE id=?",
-                    (status, reason,
-                     datetime.now(timezone.utc).isoformat()
-                     if status in ("auto_applied", "applied") else None,
-                     jid))
+        if status in ("auto_applied", "applied"):
+            # stamp the submission time, but never clobber a job that is
+            # already terminal (guards against a double-submit writing twice).
+            con.execute(
+                "UPDATE jobs SET status=?, reason=?, applied_at=? WHERE id=? "
+                "AND status NOT IN ('applied','auto_applied')",
+                (status, reason, datetime.now(timezone.utc).isoformat(), jid))
+        else:
+            # non-submit outcome (needs_review/hidden/…): update status+reason
+            # but PRESERVE applied_at — the old code nulled it, which erased a
+            # real submission timestamp if finish() ran again on an applied job.
+            con.execute("UPDATE jobs SET status=?, reason=? WHERE id=?",
+                        (status, reason, jid))
         con.commit()
         con.close()
 
@@ -1045,7 +1178,7 @@ def run(job_ref, dry_run=False, browser=None, assist=False, review=False,
     # browser (it gets bot-blocked or hits a Google/Apple sign-in wall).
     # Precheck marks them 'manual'; an assist/apply run opens the posting in
     # the user's real Chrome, where the extension autofills (⌘⇧J) and SSO works.
-    if (company or "").lower() in manual_apply_set():
+    if company_key(company) in manual_apply_set():
         if precheck:
             con.execute("UPDATE jobs SET readiness='manual', readiness_at=? "
                         "WHERE id=?",
@@ -1332,7 +1465,7 @@ def run_all(dry_run=False, limit=None, tier=None, shard=None, assist=False,
     include_review=True (assist only) also queues needs_review jobs —
     hand-review companies included, since run() forces review mode (never
     auto-submits) for them; quick wins (ready, then captcha-only) first."""
-    con = sqlite3.connect(DB_PATH, timeout=30)
+    con = _connect()
     if include_review and assist:
         sql = "SELECT id, company, title FROM jobs WHERE status IN ('new','needs_review')"
     else:
@@ -1353,7 +1486,7 @@ def run_all(dry_run=False, limit=None, tier=None, shard=None, assist=False,
         eligible, skipped = rows, 0  # visible run: review mode guards HR cos
     else:
         hr = hand_review_set()
-        eligible = [r for r in rows if (r[1] or "").lower() not in hr]
+        eligible = [r for r in rows if company_key(r[1]) not in hr]
         skipped = len(rows) - len(eligible)
     if limit:
         eligible = eligible[:limit]
@@ -1420,7 +1553,8 @@ def precheck_all(limit=None, shard=None, recheck=False):
     """Headlessly fill every inbox/review job and grade its readiness (ready /
     missing-info / captcha / form-issue) for the dashboard badge. Never submits
     or changes status. recheck=True re-grades jobs already graded."""
-    con = sqlite3.connect(DB_PATH, timeout=30)
+    prune_logs()
+    con = _connect()
     sql = "SELECT id, company, title FROM jobs WHERE status IN ('new','needs_review')"
     if not recheck:
         sql += " AND readiness IS NULL"
@@ -1475,7 +1609,25 @@ def precheck_all_parallel(workers, limit=None, recheck=False):
 
 if __name__ == "__main__":
     argv = sys.argv[1:]
+    # Reject unknown flags. A typo (e.g. --dryrun for --dry-run) used to be
+    # silently ignored, which flipped a intended dry-run into a LIVE submit.
+    KNOWN_FLAGS = {"--reconcile", "--test-code", "--dry-run", "--assist",
+                   "--review", "--precheck", "--recheck", "--ready-only",
+                   "--include-review", "--all"}
+    KNOWN_PREFIXES = ("--limit=", "--tier=", "--workers=", "--shard=")
+    for _a in argv:
+        if (_a.startswith("--") and _a not in KNOWN_FLAGS
+                and not _a.startswith(KNOWN_PREFIXES)):
+            print(f"error: unknown flag {_a!r} — refusing to run (a typo here "
+                  f"could turn an intended dry-run into a live submit).\n"
+                  f"known flags: {', '.join(sorted(KNOWN_FLAGS))}, "
+                  f"{', '.join(KNOWN_PREFIXES)}")
+            sys.exit(2)
     if "--reconcile" in argv:
+        _lk = _flock("reconcile")
+        if _lk is None:
+            print("reconcile: already running — skipping")
+            sys.exit(0)
         sys.exit(0 if reconcile_from_inbox() >= 0 else 1)
     if "--test-code" in argv:
         c = CONFIG.get("code_inbox", {})
@@ -1516,6 +1668,13 @@ if __name__ == "__main__":
 
     if precheck:
         if "--all" in argv:
+            # lock only the top-level campaign, not the sharded workers it spawns
+            # (else the first worker would starve the rest).
+            if shard is None:
+                _pk = _flock("precheck")
+                if _pk is None:
+                    print("precheck: already running — skipping")
+                    sys.exit(0)
             if workers > 1 and shard is None:
                 sys.exit(precheck_all_parallel(workers, limit=limit, recheck=recheck))
             sys.exit(precheck_all(limit=limit, shard=shard, recheck=recheck))
@@ -1527,8 +1686,10 @@ if __name__ == "__main__":
     if "--all" in argv:
         if workers > 1 and shard is None:
             sys.exit(run_all_parallel(workers, dry_run=dry, limit=limit, tier=tier))
+        # --review implies a human submits: force the visible (assist) batch so
+        # "--review --all" can't fall through to headless auto-submit.
         sys.exit(run_all(dry_run=dry, limit=limit, tier=tier, shard=shard,
-                         assist=assist, ready_only=ready_only,
+                         assist=assist or review, ready_only=ready_only,
                          include_review=include_review))
     if not positional:
         print(__doc__)

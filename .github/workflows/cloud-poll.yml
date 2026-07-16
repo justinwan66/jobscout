@@ -33,6 +33,9 @@ jobs:
           JOBSCOUT_CLOUD: "1"
           # optional: add this repo secret to enable LLM screening in the cloud
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # app password for the sending Gmail account — add as a repo secret to
+          # enable the 24/7 new-jobs email digest to jlw447@cornell.edu
+          JOBSCOUT_SMTP_PASSWORD: ${{ secrets.JOBSCOUT_SMTP_PASSWORD }}
         run: python3 scout.py cloud
 
       - name: persist state

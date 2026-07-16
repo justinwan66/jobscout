@@ -2,6 +2,8 @@
 answers.json
 profile.json
 jobs.db
+jobs.db-wal
+jobs.db-shm
 logs/
 docs/
 logos/

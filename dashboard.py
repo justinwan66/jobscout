@@ -22,15 +22,38 @@ DB_PATH = BASE / "jobs.db"
 VENV_PY = BASE / ".venv" / "bin" / "python"
 LOGO_DIR = BASE / "logos"
 PORT = 8765
+# only serve requests addressed to localhost (DNS-rebinding guard) and only
+# accept state-changing POSTs from the dashboard's own origin (CSRF guard).
+ALLOWED_HOSTS = {"127.0.0.1:8765", "localhost:8765", "127.0.0.1", "localhost"}
+ALLOWED_ORIGINS = {"http://127.0.0.1:8765", "http://localhost:8765"}
 BROWSER_UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
               "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"}
 
+def company_key(s):
+    """Normalize a company name so an ATS 'Scale AI' matches config 'scaleai'
+    — same rule the auto-apply hand-review gate uses, so badges stay in sync."""
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
 try:
     _cfg = json.loads((BASE / "config.json").read_text())
-    HAND_REVIEW = {c.lower() for c in
-                   _cfg.get("auto_apply", {}).get("hand_review_companies", [])}
+    _aa = _cfg.get("auto_apply", {})
+    HAND_REVIEW = {company_key(c) for c in _aa.get("hand_review_companies", [])}
+    # manual-apply (SSO/automation-blocked) companies always open in your own
+    # Chrome — the button labels off THIS, not the mutable readiness grade.
+    MANUAL_APPLY = {company_key(c) for c in _aa.get("manual_apply_companies", [])}
 except Exception:
     HAND_REVIEW = set()
+    MANUAL_APPLY = set()
+
+def _connect(timeout=30):
+    """SQLite connection with WAL + busy_timeout so the poller, this dashboard,
+    and auto_apply don't crash each other with 'database is locked'."""
+    con = sqlite3.connect(DB_PATH, timeout=timeout)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=30000")
+    return con
+
 
 # job_id -> Popen of an in-flight assisted-submit, so one job can't open two windows
 RUNNING = {}
@@ -183,12 +206,23 @@ async function load(force = true) {
   // don't yank an open ⋯ menu shut on the background refresh
   if (!force && list.querySelector("details[open]")) return;
   if (!jobs.length) { list.innerHTML = '<div class="empty">Nothing here.</div>'; return; }
+  // Sections are by posting day (today's postings on top, stale reqs sink to
+  // "Older"). WITHIN a day the 🎯 fit ranking leads when you've run it, then
+  // high-profile, then early-career, then freshest — so fit and freshness
+  // cooperate instead of one silently overriding the other.
+  const freshKey = j => +new Date(j.posted_at || j.first_seen) || 0;
+  jobs.sort((a, b) =>
+    ((a.fit_rank ?? 1e9) - (b.fit_rank ?? 1e9)) ||          // 🎯 fit (if ranked)
+    ((b.hand_review === true) - (a.hand_review === true)) || // ⭐ high-profile
+    ((b.tier === "hot") - (a.tier === "hot")) ||             // 🔥 early-career
+    (freshKey(b) - freshKey(a)));                            // freshest posting
   const groups = new Map(BUCKETS.map(k => [k, []]));
-  jobs.forEach(j => groups.get(bucket(j.first_seen)).push(j));
+  jobs.forEach(j => groups.get(bucket(j.posted_at || j.first_seen)).push(j));
   list.innerHTML = BUCKETS.filter(k => groups.get(k).length).map(k =>
     `<div class="day">${k}</div>` + groups.get(k).map(card).join("")).join("");
 }
 const esc = s => s.replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const safeUrl = u => /^https?:\\/\\//i.test(u || "") ? u : "#";
 function renderTabs(counts) {
   document.querySelectorAll("#tabs button").forEach(b => {
     const n = counts[b.dataset.s];
@@ -213,11 +247,11 @@ function card(j) {
       <div class="body">
         <div class="top">
           ${j.fit_display ? `<span class="fit top" title="${esc(j.fit_note||'')}">🎯 #${j.fit_display} fit</span> ` : ""}
-          <a class="title" href="${j.url}" target="_blank">${esc(j.title)}</a>
+          <a class="title" href="${esc(safeUrl(j.url))}" target="_blank" rel="noopener noreferrer">${esc(j.title)}</a>
           ${chip(j)}
         </div>
         <div class="meta">${esc(j.company)} · ${esc(j.location || "n/a")} ·
-          <span title="${new Date(j.first_seen).toLocaleString()}">first seen ${seenAgo(j.first_seen)}</span> · via ${j.source}${tierNote}</div>
+          <span title="${new Date(j.posted_at || j.first_seen).toLocaleString()}">${j.posted_at ? "posted " + seenAgo(j.posted_at) : "first seen " + seenAgo(j.first_seen)}</span> · via ${j.source}${tierNote}</div>
       </div>
       <div class="actions">
         ${(j.status === "new" || j.status === "needs_review") ? applyBtn(j) : ""}
@@ -277,8 +311,10 @@ function shortReason(t) {
 }
 function applyBtn(j) {
   // manual-apply (SSO/automation-blocked) wins even for high-profile companies —
-  // those can't be driven in the controlled browser at all
-  if (j.readiness === "manual")
+  // those can't be driven in the controlled browser at all. Decide from config
+  // membership (j.manual_apply), not the mutable readiness grade, which can go
+  // stale and mislabel the button.
+  if (j.manual_apply || j.readiness === "manual")
     return `<button class="warn" onclick="applyNow('${j.id}', this)" title="SSO/automation-blocked — opens in your Chrome; press ⌘⇧J to autofill">🧑‍💻 Open in Chrome</button>`;
   if (j.hand_review)
     return `<button class="review" onclick="applyNow('${j.id}', this)" title="fills the form, then you review & submit">🔍 Review &amp; submit</button>`;
@@ -522,15 +558,15 @@ def resolve_logo(domain):
 
 
 def query_jobs(status, q):
-    con = sqlite3.connect(DB_PATH)
+    con = _connect()
     con.row_factory = sqlite3.Row
-    for col in ("fit_rank INTEGER", "fit_note TEXT"):  # may predate rank feature
+    for col in ("fit_rank INTEGER", "fit_note TEXT", "posted_at TEXT"):  # may predate a feature
         try:
             con.execute(f"ALTER TABLE jobs ADD COLUMN {col}")
         except sqlite3.OperationalError:
             pass
     sql = ("SELECT id, source, company, title, location, url, tier, first_seen, "
-           "status, reason, readiness, fit_rank, fit_note FROM jobs WHERE 1=1")
+           "status, reason, readiness, fit_rank, fit_note, posted_at FROM jobs WHERE 1=1")
     params = []
     if status == "submitted":
         sql += " AND status IN ('applied', 'auto_applied')"
@@ -540,12 +576,14 @@ def query_jobs(status, q):
     if q:
         sql += " AND (title LIKE ? OR company LIKE ? OR location LIKE ?)"
         params += [f"%{q}%"] * 3
-    sql += " ORDER BY CASE tier WHEN 'hot' THEN 0 ELSE 1 END, first_seen DESC LIMIT 500"
+    sql += (" ORDER BY CASE tier WHEN 'hot' THEN 0 ELSE 1 END, "
+            "COALESCE(posted_at, first_seen) DESC LIMIT 500")
     rows = [dict(r) for r in con.execute(sql, params)]
     counts = dict(con.execute("SELECT status, COUNT(*) FROM jobs GROUP BY status"))
     con.close()
     for r in rows:
-        r["hand_review"] = (r.get("company") or "").lower() in HAND_REVIEW
+        r["hand_review"] = company_key(r.get("company")) in HAND_REVIEW
+        r["manual_apply"] = company_key(r.get("company")) in MANUAL_APPLY
     # badge the top 3 PER COMPANY among currently-visible jobs. fit_rank holds
     # the LLM's absolute ordering; fit_display is recomputed here each request,
     # so manually hiding a ranked job instantly promotes the next one — no
@@ -585,7 +623,26 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _host_ok(self):
+        # DNS-rebinding guard: only serve requests addressed to localhost.
+        return self.headers.get("Host", "") in ALLOWED_HOSTS
+
+    def _origin_ok(self):
+        # CSRF guard for state-changing POSTs: reject a foreign browser origin.
+        # A cross-site page always sends Origin (or at least Referer); local
+        # tools (curl) send neither, so an absent header is allowed.
+        o = self.headers.get("Origin")
+        if o is not None:
+            return o in ALLOWED_ORIGINS
+        ref = self.headers.get("Referer", "")
+        if ref:
+            return ref.startswith(tuple(u + "/" for u in ALLOWED_ORIGINS))
+        return True
+
     def do_GET(self):
+        if not self._host_ok():
+            self.send(403, "{}")
+            return
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/":
             self.send(200, PAGE, "text/html; charset=utf-8")
@@ -598,6 +655,15 @@ class Handler(BaseHTTPRequestHandler):
             # the SAME fill rules the Playwright engine uses, served to the
             # Chrome extension so manual applies (SSO/logged-in Chrome) get
             # auto-filled too. one source of truth: auto_apply.py.
+            #
+            # This returns PII (name/phone/address/EEO). The old ACAO:* let ANY
+            # website read it cross-origin. The extension fetches from its
+            # service worker (Origin absent or chrome-extension://), so only
+            # those are allowed here; a real website's fetch is refused.
+            origin = self.headers.get("Origin", "")
+            if origin and not origin.startswith("chrome-extension://"):
+                self.send(403, json.dumps({"error": "cross-origin denied"}))
+                return
             try:
                 import auto_apply as aa
                 spec = {
@@ -608,12 +674,15 @@ class Handler(BaseHTTPRequestHandler):
                 body = json.dumps(spec)
             except Exception as e:
                 body = json.dumps({"error": str(e)})
+            data = body.encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Content-Length", str(len(body.encode())))
+            if origin:  # reflect the extension origin so its fetch may read it
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Vary", "Origin")
+            self.send_header("Content-Length", str(len(data)))
             self.end_headers()
-            self.wfile.write(body.encode())
+            self.wfile.write(data)
         elif parsed.path.startswith("/logo/"):
             domain = urllib.parse.unquote(parsed.path[6:]).lower()
             if not re.fullmatch(r"[a-z0-9.-]{1,80}", domain):
@@ -633,6 +702,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send(404, "{}")
 
     def do_POST(self):
+        if not self._host_ok():
+            self.send(403, "{}")
+            return
+        if not self._origin_ok():
+            self.send(403, json.dumps({"error": "cross-origin POST denied"}))
+            return
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length)) if length else {}
 
@@ -641,7 +716,7 @@ class Handler(BaseHTTPRequestHandler):
                                           "needs_review", "auto_applied"):
                 self.send(400, "{}")
                 return
-            con = sqlite3.connect(DB_PATH, timeout=30)
+            con = _connect()
             con.execute("UPDATE jobs SET status=? WHERE id=?",
                         (body["status"], body["id"]))
             con.commit()
@@ -654,12 +729,12 @@ class Handler(BaseHTTPRequestHandler):
             if not jid:
                 self.send(400, json.dumps({"error": "no id"}))
                 return
-            con = sqlite3.connect(DB_PATH, timeout=30)
+            con = _connect()
             row = con.execute("SELECT company FROM jobs WHERE id=?",
                               (jid,)).fetchone()
             con.close()
             # high-profile -> review mode (fill + you submit); others -> assist
-            is_hr = bool(row) and (row[0] or "").lower() in HAND_REVIEW
+            is_hr = bool(row) and company_key(row[0]) in HAND_REVIEW
             mode = "--review" if is_hr else "--assist"
             # don't open a second window for a job already being applied to
             existing = RUNNING.get(jid)
@@ -691,7 +766,7 @@ class Handler(BaseHTTPRequestHandler):
             if b and b.poll() is None:
                 self.send(200, json.dumps({"status": "already running", "count": 0}))
                 return
-            con = sqlite3.connect(DB_PATH, timeout=30)
+            con = _connect()
             count = con.execute("SELECT COUNT(*) FROM jobs WHERE status='new' "
                                 "AND readiness='ready'").fetchone()[0]
             con.close()
@@ -722,7 +797,7 @@ class Handler(BaseHTTPRequestHandler):
             if b and b.poll() is None:
                 self.send(200, json.dumps({"status": "already running", "count": 0}))
                 return
-            con = sqlite3.connect(DB_PATH, timeout=30)
+            con = _connect()
             count = con.execute("SELECT COUNT(*) FROM jobs "
                                 "WHERE status IN ('new','needs_review')").fetchone()[0]
             con.close()
